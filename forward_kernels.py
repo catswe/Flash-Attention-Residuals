@@ -51,9 +51,9 @@ def naive_attention_residual(pseudo_queries, values):
     return torch.einsum("n b t, n b t d -> b t d", logits.softmax(0), values).to(DTYPE)
 
 
-def paper_forward(inputs, pseudo_queries, block_size, layers):
+def paper_forward(inputs, pseudo_queries, layers):
     block_representations = torch.zeros(
-        math.ceil(len(layers) / block_size) + 1,
+        math.ceil(len(layers) / BLOCK_SIZE) + 1,
         *inputs.shape,
         device=inputs.device,
         dtype=inputs.dtype,
@@ -67,7 +67,7 @@ def paper_forward(inputs, pseudo_queries, block_size, layers):
             block_representations[: curr_block_idx + 1].to(torch.float32),
         )
 
-        if i % block_size == 0:
+        if i % BLOCK_SIZE == 0:
             curr_block_idx += 1
 
         block_representations[curr_block_idx] += layers[i](outputs)
@@ -87,7 +87,7 @@ autotune_configs = [
     key=["NUM_SOURCE_BLOCKS", "HIDDEN_DIM", "NUM_QUERIES_PER_BLOCK", "PADDED_SRC"],
 )
 @triton.jit
-def phase_1_batched_interblock_attention_kernel(
+def phase_1_batched_interblock_attention(
     block_representations_ptr,
     pseudo_queries_ptr,
     first_layer_normalized_output_ptr,
@@ -169,58 +169,12 @@ def phase_1_batched_interblock_attention_kernel(
             )
 
 
-def phase_1_batched_interblock_attention(pseudo_queries, block_representations):
-    NUM_SOURCE_BLOCKS, B, T, HIDDEN_DIM = block_representations.shape
-    NUM_QUERIES_PER_BLOCK = pseudo_queries.shape[0]
-    PADDED_SRC = triton.next_power_of_2(NUM_SOURCE_BLOCKS)
-
-    first_layer_output = torch.empty(
-        (B, T, HIDDEN_DIM), dtype=DTYPE, device=DEVICE
-    )
-    interblock_unnormalized_outputs = torch.empty(
-        (NUM_QUERIES_PER_BLOCK - 1, B, T, HIDDEN_DIM),
-        dtype=torch.float32,
-        device=DEVICE,
-    )
-    interblock_exp_sums = torch.empty(
-        (NUM_QUERIES_PER_BLOCK - 1, B, T), dtype=torch.float32, device=DEVICE
-    )
-    interblock_max_logits = torch.empty(
-        (NUM_QUERIES_PER_BLOCK - 1, B, T), dtype=torch.float32, device=DEVICE
-    )
-
-    phase_1_batched_interblock_attention_kernel[(B * T,)](
-        block_representations,
-        pseudo_queries,
-        first_layer_output,
-        interblock_unnormalized_outputs,
-        interblock_exp_sums,
-        interblock_max_logits,
-        torch.finfo(torch.float32).eps,
-        NUM_SOURCE_BLOCKS,
-        B * T,
-        HIDDEN_DIM,
-        NUM_QUERIES_PER_BLOCK,
-        PADDED_SRC,
-    )
-
-    if NUM_QUERIES_PER_BLOCK == 1:
-        return first_layer_output
-
-    return (
-        first_layer_output,
-        interblock_unnormalized_outputs,
-        interblock_exp_sums,
-        interblock_max_logits,
-    )
-
-
 @triton.autotune(
     configs=autotune_configs,
     key=["HIDDEN_DIM"],
 )
 @triton.jit
-def phase_2_online_softmax_merge_intrablock_kernel(
+def phase_2_online_softmax_merge_intrablock(
     intrablock_partial_sum_ptr,
     pseudo_query_ptr,
     interblock_unnormalized_output_ptr,
@@ -273,73 +227,81 @@ def phase_2_online_softmax_merge_intrablock_kernel(
     )
 
 
-def phase_2_online_softmax_merge_intrablock(
-    intrablock_partial_sum,
-    pseudo_query_vector,
-    interblock_unnormalized_output,
-    interblock_exp_sum,
-    interblock_max_logit,
-):
-    B, T, HIDDEN_DIM = intrablock_partial_sum.shape
-
-    merged_output = torch.empty(B, T, HIDDEN_DIM, dtype=DTYPE, device=DEVICE)
-
-    phase_2_online_softmax_merge_intrablock_kernel[(B * T,)](
-        intrablock_partial_sum.reshape(-1, HIDDEN_DIM),
-        pseudo_query_vector,
-        interblock_unnormalized_output.reshape(-1, HIDDEN_DIM),
-        interblock_exp_sum.reshape(-1),
-        interblock_max_logit.reshape(-1),
-        merged_output.reshape(-1, HIDDEN_DIM),
-        torch.finfo(torch.float32).eps,
-        HIDDEN_DIM,
-    )
-
-    return merged_output
-
-
-def production_forward(inputs, pseudo_queries, block_size, layers):
+def production_forward(inputs, pseudo_queries, layers):
     block_representations = torch.zeros(
-        math.ceil(len(layers) / block_size) + 1,
-        *inputs.shape,
+        math.ceil(len(layers) / BLOCK_SIZE) + 1,
+        B,
+        T,
+        D,
         device=inputs.device,
         dtype=inputs.dtype,
     )
     block_representations[0] = inputs
     curr_block_idx = 0
-    interblock_max_logits, interblock_unnormalized_outputs, interblock_exp_sums = (
-        None,
-        None,
-        None,
+
+    residual_attn_output = torch.empty((B, T, D), dtype=DTYPE, device=DEVICE)
+    interblock_unnormalized_outputs = torch.empty(
+        (BLOCK_SIZE - 1, B, T, D),
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    interblock_exp_sums = torch.empty(
+        (BLOCK_SIZE - 1, B, T), dtype=torch.float32, device=DEVICE
+    )
+    interblock_max_logits = torch.empty(
+        (BLOCK_SIZE - 1, B, T), dtype=torch.float32, device=DEVICE
     )
 
     for i in range(len(layers)):
-        offset = i % block_size
-
-        if offset == 0:
+        if i % BLOCK_SIZE == 0:
             curr_block_idx += 1
-            (
-                h,
+            num_queries = min(BLOCK_SIZE, len(layers) - i)
+
+            phase_1_batched_interblock_attention[(B * T,)](
+                block_representations,
+                pseudo_queries[i : i + num_queries],
+                residual_attn_output,
                 interblock_unnormalized_outputs,
                 interblock_exp_sums,
                 interblock_max_logits,
-            ) = phase_1_batched_interblock_attention(
-                pseudo_queries[i : i + block_size],
-                block_representations[:curr_block_idx],
+                torch.finfo(torch.float32).eps,
+                curr_block_idx,
+                B * T,
+                D,
+                num_queries,
+                triton.next_power_of_2(curr_block_idx),
             )
         else:
-            h = phase_2_online_softmax_merge_intrablock(
+            offset = (i % BLOCK_SIZE) - 1
+
+            phase_2_online_softmax_merge_intrablock[(B * T,)](
                 block_representations[curr_block_idx],
                 pseudo_queries[i],
-                interblock_unnormalized_outputs[offset - 1],
-                interblock_exp_sums[offset - 1],
-                interblock_max_logits[offset - 1],
+                interblock_unnormalized_outputs[offset],
+                interblock_exp_sums[offset],
+                interblock_max_logits[offset],
+                residual_attn_output,
+                torch.finfo(torch.float32).eps,
+                D,
             )
-        block_representations[curr_block_idx] += layers[i](h)
 
-    return phase_1_batched_interblock_attention(
-        pseudo_queries[-1:], block_representations
+        block_representations[curr_block_idx] += layers[i](residual_attn_output)
+
+    phase_1_batched_interblock_attention[(B * T,)](
+        block_representations,
+        pseudo_queries[-1:],
+        residual_attn_output,
+        interblock_unnormalized_outputs,
+        interblock_exp_sums,
+        interblock_max_logits,
+        torch.finfo(torch.float32).eps,
+        curr_block_idx + 1,
+        B * T,
+        D,
+        1,
+        triton.next_power_of_2(curr_block_idx + 1),
     )
+    return residual_attn_output
 
 
 def bench(fn, *args, warmup=5, runs=20):
@@ -373,8 +335,8 @@ for i in range(10):
         layers_swiglu = [SwiGLU(D) for _ in range(NUM_LAYERS)]
         layers_identity = [Identity() for _ in range(NUM_LAYERS)]
 
-        args_swiglu = (inputs, pseudo_queries, BLOCK_SIZE, layers_swiglu)
-        args_identity = (inputs, pseudo_queries, BLOCK_SIZE, layers_identity)
+        args_swiglu = (inputs, pseudo_queries, layers_swiglu)
+        args_identity = (inputs, pseudo_queries, layers_identity)
 
         out_paper = paper_forward(*args_swiglu)
         print(f"mean abs (paper): {out_paper.abs().mean()}")
