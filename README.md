@@ -1,4 +1,4 @@
-5x inference speedup over naive torch.compile implementation 
+6x inference speedup over naive torch.compile implementation 
 
 Credits:
 Thank you Cartesia for providing support with developing this kernel
