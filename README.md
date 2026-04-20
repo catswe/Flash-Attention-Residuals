@@ -1,11 +1,15 @@
-6x inference speedup over naive torch.compile implementation 
+30% speedup over optimized torch.compile implementation of the paper’s two-phase batched inference with online softmax
 
 Credits:
-Thank you Cartesia for providing support with developing this kernel
+Thank you Cartesia for providing support developing this kernel
 
 Roadmap:
 - Backward implementation
 - Implement in CuTE and CUDA
+- Tune precision
+- Mixed FP16 and BF16 and store quantization scale
+- Stochastic rounding
+- Make into Python package
 
 Key Insights:
 - Normalizing in phase 1 keeps outputs bounded (convex combination of values) so bf16 error doesn't scale with softmax flatness. Phase 2 computes in fp32, and the reduction algebra matches split-KV Flash Attention.
