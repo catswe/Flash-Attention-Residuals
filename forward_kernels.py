@@ -21,58 +21,12 @@ NUM_LAYERS = 64
 B, T, D = 32, 1024, 512
 
 
-class SwiGLU(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.norm = nn.RMSNorm(dim, device=DEVICE, dtype=DTYPE)
-        self.linear1 = nn.Linear(dim, dim * 2, bias=False, device=DEVICE, dtype=DTYPE)
-        self.linear2 = nn.Linear(dim, dim, bias=False, device=DEVICE, dtype=DTYPE)
-
-    def forward(self, x):
-        h1, gate = self.linear1(self.norm(x)).chunk(2, dim=-1)
-        return self.linear2(F.silu(gate) * h1)
-
-
 class Identity(nn.Module):
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
         return x
-
-
-@torch.compile(mode="max-autotune-no-cudagraphs")
-def naive_attention_residual(pseudo_queries, values):
-    keys = F.rms_norm(values, (values.shape[-1],))
-
-    logits = torch.einsum("d, n b t d -> n b t", pseudo_queries, keys)
-    logits = logits - logits.max(dim=0, keepdim=True).values
-
-    return torch.einsum("n b t, n b t d -> b t d", logits.softmax(0), values).to(DTYPE)
-
-
-def paper_forward(inputs, pseudo_queries, layers):
-    block_representations = torch.zeros(
-        math.ceil(len(layers) / BLOCK_SIZE) + 1,
-        *inputs.shape,
-        device=inputs.device,
-        dtype=inputs.dtype,
-    )
-    curr_block_idx = 0
-
-    block_representations[curr_block_idx] = inputs
-    for i in range(len(layers)):
-        outputs = naive_attention_residual(
-            pseudo_queries[i].to(torch.float32),
-            block_representations[: curr_block_idx + 1].to(torch.float32),
-        )
-
-        if i % BLOCK_SIZE == 0:
-            curr_block_idx += 1
-
-        block_representations[curr_block_idx] += layers[i](outputs)
-
-    return naive_attention_residual(pseudo_queries[-1], block_representations)
 
 
 autotune_configs = [
@@ -307,6 +261,126 @@ def production_forward(inputs, pseudo_queries, layers):
     return residual_attention_output
 
 
+class SwiGLU(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = nn.RMSNorm(dim, device=DEVICE, dtype=DTYPE)
+        self.linear1 = nn.Linear(dim, dim * 2, bias=False, device=DEVICE, dtype=DTYPE)
+        self.linear2 = nn.Linear(dim, dim, bias=False, device=DEVICE, dtype=DTYPE)
+
+    def forward(self, x):
+        h1, gate = self.linear1(self.norm(x)).chunk(2, dim=-1)
+        return self.linear2(F.silu(gate) * h1)
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def naive_attention_residual(pseudo_queries, values):
+    keys = F.rms_norm(values, (values.shape[-1],))
+
+    logits = torch.einsum("d, n b t d -> n b t", pseudo_queries, keys)
+    logits = logits - logits.max(dim=0, keepdim=True).values
+
+    return torch.einsum("n b t, n b t d -> b t d", logits.softmax(0), values).to(DTYPE)
+
+
+def paper_forward(inputs, pseudo_queries, layers):
+    block_representations = torch.zeros(
+        math.ceil(len(layers) / BLOCK_SIZE) + 1,
+        *inputs.shape,
+        device=inputs.device,
+        dtype=inputs.dtype,
+    )
+    curr_block_idx = 0
+
+    block_representations[curr_block_idx] = inputs
+    for i in range(len(layers)):
+        outputs = naive_attention_residual(
+            pseudo_queries[i].to(torch.float32),
+            block_representations[: curr_block_idx + 1].to(torch.float32),
+        )
+
+        if i % BLOCK_SIZE == 0:
+            curr_block_idx += 1
+
+        block_representations[curr_block_idx] += layers[i](outputs)
+
+    return naive_attention_residual(pseudo_queries[-1], block_representations)
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def phase_1_fn(query, value):
+    S, D = query.shape
+    N, B, T, _ = value.shape
+
+    logits = (F.rms_norm(value, (D,)).reshape(-1, D) @ query.T).view(N, B, T, S)
+
+    max_logits = logits.amax(dim=0)
+    exp_weights = torch.exp(logits - max_logits.unsqueeze(0))
+    o_weighted_sum = (exp_weights.unsqueeze(-1) * value.unsqueeze(3)).sum(dim=0)
+
+    max_logits = max_logits.permute(2, 0, 1)
+    o_weighted_sum = o_weighted_sum.permute(2, 0, 1, 3)
+    l_exp_sum = exp_weights.sum(dim=0).permute(2, 0, 1)
+    h = o_weighted_sum[0] / l_exp_sum[0][..., None]
+    return max_logits, o_weighted_sum, l_exp_sum, h
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def phase_2_fn(
+    current_block_values,
+    query_vector,
+    prev_max_logits,
+    prev_exp_sum,
+    prev_weighted_value_sum,
+):
+    current_logits = (
+        F.rms_norm(current_block_values, (current_block_values.shape[-1],))
+        @ query_vector
+    )
+
+    updated_max_logits = torch.maximum(prev_max_logits, current_logits)
+    current_rescale = torch.exp(current_logits - updated_max_logits)
+    previous_rescale = torch.exp(prev_max_logits - updated_max_logits)
+
+    return (
+        previous_rescale[..., None] * prev_weighted_value_sum
+        + current_rescale[..., None] * current_block_values
+    ) / (previous_rescale * prev_exp_sum + current_rescale)[..., None]
+
+
+def torch_compile_forward(inputs, query_w, layers):
+    blocks = torch.zeros(
+        math.ceil(len(layers) / BLOCK_SIZE) + 1,
+        *inputs.shape,
+        device=inputs.device,
+        dtype=inputs.dtype,
+    )
+    blocks[0] = inputs
+    curr_block_idx = 0
+    max_logits, o_weighted_sum, l_exp_sum = None, None, None
+
+    for i in range(len(layers)):
+        offset = i % BLOCK_SIZE
+
+        if offset == 0:
+            curr_block_idx += 1
+            max_logits, o_weighted_sum, l_exp_sum, h = phase_1_fn(
+                query_w[i : i + BLOCK_SIZE], blocks[:curr_block_idx]
+            )
+        else:
+            h = phase_2_fn(
+                blocks[curr_block_idx],
+                query_w[i],
+                max_logits[offset],
+                l_exp_sum[offset],
+                o_weighted_sum[offset],
+            )
+
+        blocks[curr_block_idx] += layers[i](h.to(inputs.dtype))
+
+    return naive_attention_residual(query_w[-1], blocks)
+
+
 def bench(fn, *args, warmup=5, runs=20):
     for _ in range(warmup):
         fn(*args)
@@ -358,6 +432,7 @@ for i in range(10):
         print(f"mean abs zeros paper: {out_paper_randn.abs().mean()}")
 
         funcs_to_bench = [
+            ("torch_compile_forward", torch_compile_forward),
             ("production_forward", production_forward),
             ("paper_forward", paper_forward),
         ]
