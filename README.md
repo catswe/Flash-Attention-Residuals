@@ -1,7 +1,7 @@
 30% speedup over optimized torch.compile implementation of the paper’s two-phase batched inference with online softmax
 
 Credits:
-Thank you Cartesia for providing support developing this kernel
+Thanks to Mohamed Osman (@spaghettiSystems) and Cartesia for advising on and supporting the development of this kernel.
 
 Roadmap:
 - Backward implementation
