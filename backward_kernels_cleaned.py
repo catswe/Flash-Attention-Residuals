@@ -2,14 +2,16 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
+L = 64
 BLOCK_SIZE = 8
-NUM_LAYERS = 64
+NUM_BLOCKS = math.ceil(L / BLOCK_SIZE) + 1
 
 B, T, D = 32, 1024, 512
 
@@ -133,6 +135,10 @@ def phase_1_batched_interblock_attention(
 @triton.autotune(
     configs=autotune_configs,
     key=["HIDDEN_DIM"],
+    restore_value=[
+        "interblock_normalized_output_ptr",
+        "interblock_lse_ptr",
+    ],
 )
 @triton.jit
 def phase_2_online_softmax_merge_intrablock_kernel(
@@ -207,7 +213,7 @@ def phase_2_online_softmax_merge_intrablock(
 
 def production_forward(inputs, pseudo_queries, layers):
     block_representations = torch.zeros(
-        math.ceil(len(layers) / BLOCK_SIZE) + 1,
+        NUM_BLOCKS,
         B,
         T,
         D,
@@ -217,21 +223,21 @@ def production_forward(inputs, pseudo_queries, layers):
     block_representations[0] = inputs
 
     attn_out = torch.empty(
-        (len(layers) + 1, B, T, D),
+        (L + 1, B, T, D),
         dtype=torch.bfloat16,
         device=DEVICE,
     )
     attn_lse = torch.empty(
-        (len(layers) + 1, B, T),
+        (L + 1, B, T),
         dtype=torch.float32,
         device=DEVICE,
     )
 
-    for i in range(len(layers)):
+    for i in range(L):
         curr_block_idx = i // BLOCK_SIZE + 1
 
         if i % BLOCK_SIZE == 0:
-            num_queries = min(BLOCK_SIZE, len(layers) - i)
+            num_queries = min(BLOCK_SIZE, L - i)
 
             phase_1_batched_interblock_attention(
                 block_representations[:curr_block_idx],
@@ -258,99 +264,131 @@ def production_forward(inputs, pseudo_queries, layers):
     return attn_out[-1]
 
 
+class SwiGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.RMSNorm(D, device=DEVICE, dtype=DTYPE)
+        self.linear1 = nn.Linear(D, D * 2, bias=False, device=DEVICE, dtype=DTYPE)
+        self.linear2 = nn.Linear(D, D, bias=False, device=DEVICE, dtype=DTYPE)
+
+    def forward(self, x):
+        h1, gate = self.linear1(self.norm(x)).chunk(2, dim=-1)
+        return self.linear2(F.silu(gate) * h1)
+
+
 inputs = torch.randn(B, T, D, device=DEVICE, dtype=DTYPE)
 pseudo_queries = torch.randn(
-    NUM_LAYERS + 1,
+    L + 1,
     D,
     device=DEVICE,
     dtype=DTYPE,
     requires_grad=True,
 )
-layers_identity = [Identity() for _ in range(NUM_LAYERS)]
-out = production_forward(inputs, pseudo_queries, layers_identity)
+layers_swiglu = [SwiGLU() for _ in range(L)]
+out = production_forward(inputs, pseudo_queries, layers_swiglu)
 
 
-class ProductionAttention(torch.autograd.Function):
+class BlockwiseAttentionFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, inputs, pseudo_queries, layers):
+    def forward(ctx, inputs, pseudo_queries, layers, eps, *flat_layer_params):
         block_representations = torch.zeros(
-            math.ceil(len(layers) / BLOCK_SIZE) + 1,
+            NUM_BLOCKS,
             B,
             T,
             D,
             device=inputs.device,
             dtype=inputs.dtype,
         )
-        block_representations[0] = inputs
-        attn_out = torch.empty((len(layers) + 1, B, T, D), dtype=DTYPE, device=DEVICE)
+        block_representations[0].copy_(inputs)
+
         attn_lse = torch.empty(
-            (len(layers) + 1, B, T), dtype=torch.float32, device=DEVICE
+            L + 1,
+            B,
+            T,
+            device=inputs.device,
+            dtype=torch.float32,
         )
-        for i in range(len(layers)):
-            curr_block_idx = i // BLOCK_SIZE + 1
-            if i % BLOCK_SIZE == 0:
-                num_queries = min(BLOCK_SIZE, len(layers) - i)
-                phase_1_batched_interblock_attention(
-                    block_representations[:curr_block_idx],
-                    pseudo_queries[i : i + num_queries],
-                    attn_out[i : i + num_queries],
-                    attn_lse[i : i + num_queries],
+
+        for block_start in range(0, L, BLOCK_SIZE):
+            curr_block_idx = block_start // BLOCK_SIZE + 1
+            num_queries = min(BLOCK_SIZE, L - block_start)
+
+            block_attn_out = torch.empty(
+                num_queries,
+                B,
+                T,
+                D,
+                device=inputs.device,
+                dtype=torch.bfloat16,
+            )
+
+            phase_1_batched_interblock_attention(
+                block_representations[:curr_block_idx],
+                pseudo_queries[block_start : block_start + num_queries],
+                block_attn_out,
+                attn_lse[block_start : block_start + num_queries],
+                eps=eps,
+            )
+
+            for query_offset in range(num_queries):
+                i = block_start + query_offset
+
+                if query_offset != 0:
+                    phase_2_online_softmax_merge_intrablock(
+                        block_representations[curr_block_idx],
+                        pseudo_queries[i],
+                        block_attn_out[query_offset],
+                        attn_lse[i],
+                        eps=eps,
+                    )
+
+                block_representations[curr_block_idx].add_(
+                    layers[i](block_attn_out[query_offset])
                 )
-            else:
-                phase_2_online_softmax_merge_intrablock(
-                    block_representations[curr_block_idx],
-                    pseudo_queries[i],
-                    attn_out[i],
-                    attn_lse[i],
-                )
-            block_representations[curr_block_idx] += layers[i](attn_out[i])
+
+        final_out = torch.empty(
+            B,
+            T,
+            D,
+            device=inputs.device,
+            dtype=inputs.dtype,
+        )
+
         phase_1_batched_interblock_attention(
             block_representations,
             pseudo_queries[-1:],
-            attn_out[-1:],
+            final_out.unsqueeze(0),
             attn_lse[-1:],
+            eps=eps,
         )
+
         ctx.save_for_backward(
-            inputs,
-            pseudo_queries,
             block_representations,
-            attn_out,
             attn_lse,
+            pseudo_queries,
+            *flat_layer_params,
         )
         ctx.layers = layers
-        return attn_out[-1]
+        ctx.eps = eps
+        ctx.num_layer_params = len(flat_layer_params)
+
+        return final_out
 
     @staticmethod
-    def backward(ctx, grad_output):
-        inputs, pseudo_queries, block_reps, attn_out, attn_lse = ctx.saved_tensors
-        layers = ctx.layers
-        attn_out_pre = torch.empty_like(attn_out)
-        attn_lse_pre = torch.empty_like(attn_lse)
-        for k_start in range(0, len(layers), BLOCK_SIZE):
-            n = min(BLOCK_SIZE, len(layers) - k_start)
-            cbi = k_start // BLOCK_SIZE + 1
-            phase_1_batched_interblock_attention(
-                block_reps[:cbi],
-                pseudo_queries[k_start : k_start + n],
-                attn_out_pre[k_start : k_start + n],
-                attn_lse_pre[k_start : k_start + n],
-            )
-        d_block_reps = torch.zeros_like(block_reps, dtype=torch.float32)
-        d_pseudo_queries = torch.zeros_like(pseudo_queries, dtype=torch.float32)
-        d_attn_out = torch.zeros_like(attn_out, dtype=torch.float32)
-        running = block_reps.clone()
-        for i in reversed(range(len(layers))):
-            cbi = i // BLOCK_SIZE + 1
-            with torch.enable_grad():
-                ao = attn_out[i].detach().requires_grad_(True)
-                lo = layers[i](ao)
-                d_attn_out[i] += torch.autograd.grad(
-                    lo, ao, grad_outputs=d_block_reps[cbi].to(lo.dtype)
-                )[0].float()
-                running[cbi] -= lo.detach()
-            if i % BLOCK_SIZE == 0:
-                pass
-            else:
-                pass
-        d_inputs = d_block_reps[0].to(inputs.dtype)
-        return d_inputs, d_pseudo_queries.to(pseudo_queries.dtype), None
+    def backward(ctx, *grad_outputs):
+        grad_output = grad_outputs[0]
+
+
+def production_forward_custom_autograd(inputs, pseudo_queries, layers, eps=None):
+    if eps is None:
+        eps = torch.finfo(torch.float32).eps
+
+    flat_layer_params = tuple(p for layer in layers for p in layer.parameters())
+
+    return BlockwiseAttentionFunction.apply(
+        inputs,
+        pseudo_queries,
+        layers,
+        eps,
+        *flat_layer_params,
+    )
