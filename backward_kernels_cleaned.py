@@ -14,7 +14,7 @@ BLOCK_SIZE = 8
 NUM_BLOCKS = math.ceil(L / BLOCK_SIZE) + 1
 
 B, T, D = 32, 1024, 512
-BT = BT
+BT = B * T
 
 
 class Identity(nn.Module):
@@ -695,6 +695,7 @@ def phase_2_online_softmax_merge_intrablock_backward(
     grad_phase1_interblock_normalized_output,
     grad_phase1_interblock_logsumexp,
     eps=None,
+    grad_pseudo_query_partial=None,
 ):
     if eps is None:
         eps = torch.finfo(torch.float32).eps
@@ -702,11 +703,12 @@ def phase_2_online_softmax_merge_intrablock_backward(
     if grad_merged_logsumexp is None:
         grad_merged_logsumexp = torch.zeros_like(phase1_interblock_logsumexp)
 
-    grad_pseudo_query_partial = torch.empty(
-        (BT, D),
-        device=intrablock_partial_sum.device,
-        dtype=torch.float32,
-    )
+    if grad_pseudo_query_partial is None:
+        grad_pseudo_query_partial = torch.empty(
+            (BT, D),
+            device=intrablock_partial_sum.device,
+            dtype=torch.float32,
+        )
 
     phase_2_online_softmax_merge_intrablock_backward_kernel[(BT,)](
         intrablock_partial_sum,
