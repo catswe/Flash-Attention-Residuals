@@ -291,6 +291,12 @@ out = production_forward(inputs, pseudo_queries, layers_swiglu)
 @triton.autotune(
     configs=autotune_configs,
     key=["HIDDEN_DIM"],
+    restore_value=[
+        "grad_intrablock_partial_sum_ptr",
+        "grad_pseudo_query_ptr",
+        "grad_prev_interblock_normalized_output_ptr",
+        "grad_prev_interblock_lse_ptr",
+    ],
 )
 @triton.jit
 def phase_2_online_softmax_merge_intrablock_backward_kernel(
