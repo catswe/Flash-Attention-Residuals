@@ -794,7 +794,6 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
 
         ctx.save_for_backward(
             block_representations,
-            attn_lse,
             pseudo_queries,
             *flat_layer_params,
         )
