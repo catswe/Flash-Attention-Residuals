@@ -522,8 +522,6 @@ def phase_2_online_softmax_merge_intrablock_backward_kernel(
         grad_merged_attention_output_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range
     ).to(tl.float32)
 
-    grad_merged_logsumexp = 0.0
-
     intrablock_partial_sum_squared_norm = tl.sum(
         intrablock_partial_sum * intrablock_partial_sum
     )
@@ -692,9 +690,6 @@ def phase_2_online_softmax_merge_intrablock_backward(
 ):
     if eps is None:
         eps = torch.finfo(torch.float32).eps
-
-    if grad_merged_logsumexp is None:
-        grad_merged_logsumexp = torch.zeros_like(phase1_interblock_logsumexp)
 
     phase_2_online_softmax_merge_intrablock_backward_kernel[(BT,)](
         intrablock_partial_sum,
