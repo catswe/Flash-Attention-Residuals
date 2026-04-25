@@ -489,7 +489,6 @@ def phase_2_online_softmax_merge_intrablock_backward_kernel(
     phase1_interblock_normalized_output_ptr,
     phase1_interblock_logsumexp_ptr,
     grad_merged_attention_output_ptr,
-    grad_merged_logsumexp_ptr,
     grad_intrablock_partial_sum_accumulator_ptr,
     grad_pseudo_query_partial_ptr,
     grad_phase1_interblock_normalized_output_ptr,
@@ -523,9 +522,7 @@ def phase_2_online_softmax_merge_intrablock_backward_kernel(
         grad_merged_attention_output_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range
     ).to(tl.float32)
 
-    grad_merged_logsumexp = tl.load(grad_merged_logsumexp_ptr + batch_seq_idx).to(
-        tl.float32
-    )
+    grad_merged_logsumexp = 0.0
 
     intrablock_partial_sum_squared_norm = tl.sum(
         intrablock_partial_sum * intrablock_partial_sum
@@ -560,17 +557,14 @@ def phase_2_online_softmax_merge_intrablock_backward_kernel(
         * (phase1_interblock_normalized_output - intrablock_partial_sum)
     )
 
+    merge_probability_product = phase1_merge_probability * phase2_merge_probability
+
     grad_phase1_interblock_logsumexp = (
-        phase1_merge_probability * grad_merged_logsumexp
-        + phase1_merge_probability
-        * phase2_merge_probability
-        * grad_output_dot_interblock_minus_intrablock
+        merge_probability_product * grad_output_dot_interblock_minus_intrablock
     )
+
     grad_phase2_intrablock_logit = (
-        phase2_merge_probability * grad_merged_logsumexp
-        - phase1_merge_probability
-        * phase2_merge_probability
-        * grad_output_dot_interblock_minus_intrablock
+        -merge_probability_product * grad_output_dot_interblock_minus_intrablock
     )
 
     intrablock_inverse_rms_norm_cubed = (
@@ -689,13 +683,12 @@ def phase_2_online_softmax_merge_intrablock_backward(
     phase1_interblock_normalized_output,
     phase1_interblock_logsumexp,
     grad_merged_attention_output,
-    grad_merged_logsumexp,
     grad_intrablock_partial_sum,
     grad_pseudo_query,
     grad_phase1_interblock_normalized_output,
     grad_phase1_interblock_logsumexp,
+    grad_pseudo_query_partial,
     eps=None,
-    grad_pseudo_query_partial=None,
 ):
     if eps is None:
         eps = torch.finfo(torch.float32).eps
@@ -703,20 +696,12 @@ def phase_2_online_softmax_merge_intrablock_backward(
     if grad_merged_logsumexp is None:
         grad_merged_logsumexp = torch.zeros_like(phase1_interblock_logsumexp)
 
-    if grad_pseudo_query_partial is None:
-        grad_pseudo_query_partial = torch.empty(
-            (BT, D),
-            device=intrablock_partial_sum.device,
-            dtype=torch.float32,
-        )
-
     phase_2_online_softmax_merge_intrablock_backward_kernel[(BT,)](
         intrablock_partial_sum,
         pseudo_query,
         phase1_interblock_normalized_output,
         phase1_interblock_logsumexp,
         grad_merged_attention_output,
-        grad_merged_logsumexp,
         grad_intrablock_partial_sum,
         grad_pseudo_query_partial,
         grad_phase1_interblock_normalized_output,
