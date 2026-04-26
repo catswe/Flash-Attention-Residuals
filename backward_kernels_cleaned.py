@@ -218,7 +218,7 @@ def production_forward(inputs, pseudo_queries, layers):
         B,
         T,
         D,
-        device=inputs.device,
+        device=DEVICE,
         dtype=inputs.dtype,
     )
     block_representations[0] = inputs
@@ -294,7 +294,6 @@ out = production_forward(inputs, pseudo_queries, layers_swiglu)
     key=["NUM_SOURCE_BLOCKS", "HIDDEN_DIM", "NUM_QUERIES_PER_BLOCK", "PADDED_SRC"],
     restore_value=[
         "grad_block_representations_accumulator_ptr",
-        "grad_pseudo_queries_accumulator_ptr",
     ],
 )
 @triton.jit
@@ -305,7 +304,7 @@ def phase_1_batched_interblock_attention_backward_kernel(
     grad_softmax_normalized_output_ptr,
     grad_lse_ptr,
     grad_block_representations_accumulator_ptr,
-    grad_pseudo_queries_accumulator_ptr,
+    grad_pseudo_queries_partial_ptr,
     eps,
     NUM_SOURCE_BLOCKS: tl.constexpr,
     BT: tl.constexpr,
@@ -335,7 +334,6 @@ def phase_1_batched_interblock_attention_backward_kernel(
 
     squared_norm_sum = tl.sum(source_block_values * source_block_values, axis=1)
     inverse_rms_norm = tl.rsqrt(squared_norm_sum / float(HIDDEN_DIM) + eps)
-
     inverse_rms_norm_cubed = inverse_rms_norm * inverse_rms_norm * inverse_rms_norm
 
     for layer_offset in tl.static_range(NUM_QUERIES_PER_BLOCK):
@@ -428,13 +426,78 @@ def phase_1_batched_interblock_attention_backward_kernel(
             sem="relaxed",
         )
 
-        tl.atomic_add(
-            grad_pseudo_queries_accumulator_ptr
-            + layer_offset * HIDDEN_DIM
+        tl.store(
+            grad_pseudo_queries_partial_ptr
+            + layer_offset * BT * HIDDEN_DIM
+            + batch_seq_idx * HIDDEN_DIM
             + hidden_dim_range_1d,
             grad_pseudo_query,
-            sem="relaxed",
         )
+
+
+phase_1_reduce_configs = [
+    triton.Config(
+        {
+            "BLOCK_BATCH_SEQ": block_batch_seq,
+            "BLOCK_HIDDEN": block_hidden,
+        },
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    for block_batch_seq in [64, 128, 256]
+    for block_hidden in [16, 32]
+    for num_warps in [4, 8]
+]
+
+
+@triton.autotune(
+    configs=phase_1_reduce_configs,
+    key=["NUM_BATCH_SEQ", "HIDDEN_DIM", "NUM_QUERIES_PER_BLOCK"],
+    restore_value=[
+        "grad_pseudo_queries_accumulator_ptr",
+    ],
+)
+@triton.jit
+def phase_1_reduce_grad_pseudo_queries_kernel(
+    grad_pseudo_queries_partial_ptr,
+    grad_pseudo_queries_accumulator_ptr,
+    NUM_BATCH_SEQ: tl.constexpr,
+    HIDDEN_DIM: tl.constexpr,
+    NUM_QUERIES_PER_BLOCK: tl.constexpr,
+    BLOCK_BATCH_SEQ: tl.constexpr,
+    BLOCK_HIDDEN: tl.constexpr,
+):
+    batch_seq_block_idx = tl.program_id(0)
+    query_idx = tl.program_id(1)
+    hidden_block_idx = tl.program_id(2)
+
+    batch_seq_offsets = batch_seq_block_idx * BLOCK_BATCH_SEQ + tl.arange(
+        0, BLOCK_BATCH_SEQ
+    )
+
+    hidden_offsets = hidden_block_idx * BLOCK_HIDDEN + tl.arange(0, BLOCK_HIDDEN)
+
+    grad_tile = tl.load(
+        grad_pseudo_queries_partial_ptr
+        + query_idx * NUM_BATCH_SEQ * HIDDEN_DIM
+        + batch_seq_offsets[:, None] * HIDDEN_DIM
+        + hidden_offsets[None, :],
+        mask=(
+            (batch_seq_offsets[:, None] < NUM_BATCH_SEQ)
+            & (hidden_offsets[None, :] < HIDDEN_DIM)
+            & (query_idx < NUM_QUERIES_PER_BLOCK)
+        ),
+        other=0.0,
+    ).to(tl.float32)
+
+    grad_reduced = tl.sum(grad_tile, axis=0)
+
+    tl.atomic_add(
+        grad_pseudo_queries_accumulator_ptr + query_idx * HIDDEN_DIM + hidden_offsets,
+        grad_reduced,
+        mask=((hidden_offsets < HIDDEN_DIM) & (query_idx < NUM_QUERIES_PER_BLOCK)),
+        sem="relaxed",
+    )
 
 
 def phase_1_batched_interblock_attention_backward(
@@ -445,6 +508,7 @@ def phase_1_batched_interblock_attention_backward(
     grad_lses,
     grad_block_representations,
     grad_pseudo_queries,
+    grad_pseudo_queries_partial,
     eps=None,
 ):
     NUM_QUERIES = pseudo_queries.shape[0]
@@ -463,13 +527,27 @@ def phase_1_batched_interblock_attention_backward(
         grad_softmax_outputs,
         grad_lses,
         grad_block_representations,
-        grad_pseudo_queries,
+        grad_pseudo_queries_partial,
         eps,
         NUM_SOURCE_BLOCKS,
         BT,
         D,
         NUM_QUERIES,
         triton.next_power_of_2(NUM_SOURCE_BLOCKS),
+    )
+
+    phase_1_reduce_grad_pseudo_queries_kernel[
+        lambda META: (
+            triton.cdiv(BT, META["BLOCK_BATCH_SEQ"]),
+            NUM_QUERIES,
+            triton.cdiv(D, META["BLOCK_HIDDEN"]),
+        )
+    ](
+        grad_pseudo_queries_partial,
+        grad_pseudo_queries,
+        BT,
+        D,
+        NUM_QUERIES,
     )
 
 
@@ -726,7 +804,7 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
             B,
             T,
             D,
-            device=inputs.device,
+            device=DEVICE,
             dtype=inputs.dtype,
         )
         block_representations[0].copy_(inputs)
@@ -735,7 +813,7 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
             L + 1,
             B,
             T,
-            device=inputs.device,
+            device=DEVICE,
             dtype=torch.float32,
         )
 
@@ -748,7 +826,7 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
                 B,
                 T,
                 D,
-                device=inputs.device,
+                device=DEVICE,
                 dtype=torch.bfloat16,
             )
 
@@ -780,7 +858,7 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
             B,
             T,
             D,
-            device=inputs.device,
+            device=DEVICE,
             dtype=inputs.dtype,
         )
 
