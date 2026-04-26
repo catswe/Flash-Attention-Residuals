@@ -18,6 +18,7 @@ NUM_BLOCKS = math.ceil(L / BLOCK_SIZE) + 1
 B, T, D = 32, 1024, 512
 BT = B * T
 
+EPS = torch.finfo(torch.float32).eps
 
 autotune_configs = [
     triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -111,7 +112,7 @@ def phase_1_batched_interblock_attention(
     NUM_SOURCE_BLOCKS = block_representations.shape[0]
 
     if eps is None:
-        eps = torch.finfo(torch.float32).eps
+        eps = EPS
 
     phase_1_batched_interblock_attention_kernel[(BT,)](
         block_representations,
@@ -189,7 +190,7 @@ def phase_2_online_softmax_merge_intrablock(
     eps=None,
 ):
     if eps is None:
-        eps = torch.finfo(torch.float32).eps
+        eps = EPS
 
     phase_2_online_softmax_merge_intrablock_kernel[(BT,)](
         intrablock_partial_sum,
@@ -431,7 +432,7 @@ def phase_1_batched_interblock_attention_backward(
     NUM_SOURCE_BLOCKS = block_representations.shape[0]
 
     if eps is None:
-        eps = torch.finfo(torch.float32).eps
+        eps = EPS
 
     has_grad_lses = grad_lses is not None
     if grad_lses is None:
@@ -671,7 +672,7 @@ def phase_2_online_softmax_merge_intrablock_backward(
     eps=None,
 ):
     if eps is None:
-        eps = torch.finfo(torch.float32).eps
+        eps = EPS
 
     phase_2_online_softmax_merge_intrablock_backward_kernel[(BT,)](
         intrablock_partial_sum,
@@ -873,7 +874,7 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
                     grad_outputs=grad_update_f32.to(dtype=update.dtype),
                     retain_graph=False,
                     create_graph=False,
-                    allow_unused=True,
+                    allow_unused=False,
                 )
 
             grad_layer_input = grad_results[0]
@@ -1138,7 +1139,7 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
 
 def production_forward(inputs, pseudo_queries, layers, eps=None):
     if eps is None:
-        eps = torch.finfo(torch.float32).eps
+        eps = EPS
 
     flat_layer_params = tuple(p for layer in layers for p in layer.parameters())
 
@@ -1152,118 +1153,123 @@ def production_forward(inputs, pseudo_queries, layers, eps=None):
 
 
 @torch.compile(mode="max-autotune-no-cudagraphs")
-def naive_attention_residual(pseudo_queries, values):
-    keys = F.rms_norm(values, (values.shape[-1],))
+def naive_attention_residual(pseudo_query, values):
+    pseudo_query = pseudo_query.to(torch.float32)
+    values = values.to(torch.float32)
 
-    logits = torch.einsum("d, n b t d -> n b t", pseudo_queries, keys)
+    keys = F.rms_norm(values, (values.shape[-1],), eps=EPS)
+
+    logits = torch.einsum("d, n b t d -> n b t", pseudo_query, keys)
     logits = logits - logits.max(dim=0, keepdim=True).values
 
-    return torch.einsum("n b t, n b t d -> b t d", logits.softmax(0), values).to(DTYPE)
+    return torch.einsum(
+        "n b t, n b t d -> b t d",
+        logits.softmax(0),
+        values,
+    ).to(DTYPE)
 
 
 def paper_forward(inputs, pseudo_queries, layers):
-    block_representations = torch.zeros(
-        math.ceil(len(layers) / BLOCK_SIZE) + 1,
-        *inputs.shape,
-        device=inputs.device,
-        dtype=inputs.dtype,
-    )
-    curr_block_idx = 0
+    blocks = [inputs]
 
-    block_representations[curr_block_idx] = inputs
     for i in range(len(layers)):
         outputs = naive_attention_residual(
-            pseudo_queries[i].to(torch.float32),
-            block_representations[: curr_block_idx + 1].to(torch.float32),
+            pseudo_queries[i],
+            torch.stack(blocks, dim=0),
         )
 
+        update = layers[i](outputs)
+
         if i % BLOCK_SIZE == 0:
-            curr_block_idx += 1
+            blocks.append(update)
+        else:
+            blocks[-1] = blocks[-1] + update
 
-        block_representations[curr_block_idx] += layers[i](outputs)
-
-    return naive_attention_residual(pseudo_queries[-1], block_representations)
+    return naive_attention_residual(
+        pseudo_queries[-1],
+        torch.stack(blocks, dim=0),
+    )
 
 
 @torch.compile(mode="max-autotune-no-cudagraphs")
 def phase_1_fn(query, value):
-    S, D = query.shape
-    N, B, T, _ = value.shape
+    query = query.to(torch.float32)
+    value = value.to(torch.float32)
 
-    logits = (F.rms_norm(value, (D,)).reshape(-1, D) @ query.T).view(N, B, T, S)
+    S, D_ = query.shape
+    N, B_, T_, _ = value.shape
+
+    logits = (F.rms_norm(value, (D_,), eps=EPS).reshape(-1, D_) @ query.T).view(
+        N, B_, T_, S
+    )
 
     max_logits = logits.amax(dim=0)
     exp_weights = torch.exp(logits - max_logits.unsqueeze(0))
-    o_weighted_sum = (exp_weights.unsqueeze(-1) * value.unsqueeze(3)).sum(dim=0)
+    exp_sum = exp_weights.sum(dim=0)
 
-    max_logits = max_logits.permute(2, 0, 1)
-    o_weighted_sum = o_weighted_sum.permute(2, 0, 1, 3)
-    l_exp_sum = exp_weights.sum(dim=0).permute(2, 0, 1)
-    h = o_weighted_sum[0] / l_exp_sum[0][..., None]
-    return max_logits, o_weighted_sum, l_exp_sum, h
+    weighted_sum = (exp_weights.unsqueeze(-1) * value.unsqueeze(3)).sum(dim=0)
+    normalized = (weighted_sum / exp_sum[..., None]).permute(2, 0, 1, 3).to(DTYPE)
+
+    lse = (max_logits + torch.log(exp_sum)).permute(2, 0, 1)
+
+    h = normalized[0]
+    return lse, normalized, h
 
 
 @torch.compile(mode="max-autotune-no-cudagraphs")
-def phase_2_fn(
-    current_block_values,
-    query_vector,
-    prev_max_logits,
-    prev_exp_sum,
-    prev_weighted_value_sum,
-):
-    current_logits = (
-        F.rms_norm(current_block_values, (current_block_values.shape[-1],))
-        @ query_vector
+def phase_2_fn(current_block_values, query_vector, prev_lse, prev_normalized):
+    current_block_values_f32 = current_block_values.to(torch.float32)
+    query_vector_f32 = query_vector.to(torch.float32)
+    prev_normalized_f32 = prev_normalized.to(torch.float32)
+
+    current_logit = (
+        F.rms_norm(
+            current_block_values_f32,
+            (current_block_values_f32.shape[-1],),
+            eps=EPS,
+        )
+        @ query_vector_f32
     )
 
-    updated_max_logits = torch.maximum(prev_max_logits, current_logits)
-    current_rescale = torch.exp(current_logits - updated_max_logits)
-    previous_rescale = torch.exp(prev_max_logits - updated_max_logits)
+    merged_max = torch.maximum(prev_lse, current_logit)
+    interblock_weight = torch.exp(prev_lse - merged_max)
+    intrablock_weight = torch.exp(current_logit - merged_max)
 
     return (
-        previous_rescale[..., None] * prev_weighted_value_sum
-        + current_rescale[..., None] * current_block_values
-    ) / (previous_rescale * prev_exp_sum + current_rescale)[..., None]
+        interblock_weight[..., None] * prev_normalized_f32
+        + intrablock_weight[..., None] * current_block_values_f32
+    ) / (interblock_weight + intrablock_weight)[..., None]
 
 
-def torch_compile_forward(inputs, query_w, layers):
-    blocks = torch.zeros(
-        math.ceil(len(layers) / BLOCK_SIZE) + 1,
-        *inputs.shape,
-        device=inputs.device,
-        dtype=inputs.dtype,
-    )
-    blocks[0] = inputs
-    curr_block_idx = 0
-    max_logits, o_weighted_sum, l_exp_sum = None, None, None
+def torch_compile_phases_forward(inputs, query_w, layers):
+    blocks = [inputs]
 
     for i in range(len(layers)):
         offset = i % BLOCK_SIZE
 
         if offset == 0:
-            curr_block_idx += 1
-            max_logits, o_weighted_sum, l_exp_sum, h = phase_1_fn(
-                query_w[i : i + BLOCK_SIZE], blocks[:curr_block_idx]
-            )
+            values = torch.stack(blocks, dim=0)
+
+            lse, normalized, h = phase_1_fn(query_w[i : i + BLOCK_SIZE], values)
+            blocks.append(layers[i](h.to(inputs.dtype)))
         else:
             h = phase_2_fn(
-                blocks[curr_block_idx],
+                blocks[-1],
                 query_w[i],
-                max_logits[offset],
-                l_exp_sum[offset],
-                o_weighted_sum[offset],
+                lse[offset],
+                normalized[offset],
             )
 
-        blocks[curr_block_idx] += layers[i](h.to(inputs.dtype))
+            blocks[-1] = blocks[-1] + layers[i](h.to(inputs.dtype))
 
-    _, _, _, h = phase_1_fn(query_w[-1:], blocks)
+    _, _, h = phase_1_fn(query_w[-1:], torch.stack(blocks, dim=0))
     return h.to(inputs.dtype)
 
 
 class SwiGLU(nn.Module):
     def __init__(self):
         super().__init__()
-        self.norm = nn.RMSNorm(D, device=DEVICE, dtype=DTYPE)
+        self.norm = nn.RMSNorm(D, device=DEVICE, dtype=DTYPE, eps=EPS)
         self.linear1 = nn.Linear(D, D * 2, bias=False, device=DEVICE, dtype=DTYPE)
         self.linear2 = nn.Linear(D, D, bias=False, device=DEVICE, dtype=DTYPE)
 
@@ -1280,21 +1286,156 @@ class Identity(nn.Module):
         return x
 
 
-def bench(fn, *args, warmup=5, runs=20):
+def grad_targets(inputs, pseudo_queries, layers):
+    params = tuple(p for layer in layers for p in layer.parameters() if p.requires_grad)
+    return (inputs, pseudo_queries, *params)
+
+
+def bench_fwd_bwd(fn, inputs, pseudo_queries, layers, grad_out, warmup=3, runs=10):
+    targets = grad_targets(inputs, pseudo_queries, layers)
+
     for _ in range(warmup):
-        fn(*args)
+        out = fn(inputs, pseudo_queries, layers)
+        torch.autograd.grad(
+            outputs=out,
+            inputs=targets,
+            grad_outputs=grad_out,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+
     for _ in range(runs):
-        fn(*args)
+        out = fn(inputs, pseudo_queries, layers)
+        torch.autograd.grad(
+            outputs=out,
+            inputs=targets,
+            grad_outputs=grad_out,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )
+
     torch.cuda.synchronize()
 
     return (time.perf_counter() - t0) / runs * 1000
 
 
+def collect_grads(fn, inputs, pseudo_queries, layers, grad_out):
+    targets = grad_targets(inputs, pseudo_queries, layers)
+
+    out = fn(inputs, pseudo_queries, layers)
+
+    grads = torch.autograd.grad(
+        outputs=out,
+        inputs=targets,
+        grad_outputs=grad_out,
+        retain_graph=False,
+        create_graph=False,
+        allow_unused=False,
+    )
+
+    grads = [g.detach().to(torch.float32) for g in grads]
+    return out.detach(), grads
+
+
+def compare_grads(
+    ref_name, ref_fn, test_name, test_fn, inputs, pseudo_queries, layers, grad_out
+):
+    ref_out, ref_grads = collect_grads(ref_fn, inputs, pseudo_queries, layers, grad_out)
+    test_out, test_grads = collect_grads(
+        test_fn, inputs, pseudo_queries, layers, grad_out
+    )
+
+    out_abs = (ref_out.to(torch.float32) - test_out.to(torch.float32)).abs()
+    print(
+        f"{test_name} vs {ref_name} output: "
+        f"mean_abs={out_abs.mean()}, max_abs={out_abs.max()}"
+    )
+
+    for idx, (rg, tg) in enumerate(zip(ref_grads, test_grads)):
+        if rg is None or tg is None:
+            print(
+                f"{test_name} grad[{idx}] vs {ref_name}: "
+                f"None mismatch: ref_is_none={rg is None}, test_is_none={tg is None}"
+            )
+            continue
+
+        diff = (rg - tg).abs()
+        rel = diff / (rg.abs() + 1e-3)
+
+        print(
+            f"{test_name} grad[{idx}] vs {ref_name}: "
+            f"mean_abs={diff.mean()}, max_abs={diff.max()}, "
+            f"mean_rel={rel.mean()}, max_rel={rel.max()}"
+        )
+
+
+def bench_backward_only(
+    fn, inputs, pseudo_queries, layers, grad_out, warmup=3, runs=10
+):
+    targets = grad_targets(inputs, pseudo_queries, layers)
+
+    for _ in range(warmup):
+        out = fn(inputs, pseudo_queries, layers)
+        torch.cuda.synchronize()
+
+        torch.autograd.grad(
+            outputs=out,
+            inputs=targets,
+            grad_outputs=grad_out,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )
+        torch.cuda.synchronize()
+
+    total = 0.0
+
+    for _ in range(runs):
+        out = fn(inputs, pseudo_queries, layers)
+        torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        torch.autograd.grad(
+            outputs=out,
+            inputs=targets,
+            grad_outputs=grad_out,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
+        )
+        torch.cuda.synchronize()
+
+        total += time.perf_counter() - t0
+
+    return total / runs * 1000
+
+
+def print_bench_group(title, args):
+    print(title)
+    for name, func in funcs_to_bench:
+        fwd_bwd = bench_fwd_bwd(func, *args, grad_out)
+        bwd = bench_backward_only(func, *args, grad_out)
+        print(f"{name} fwd+bwd:  {fwd_bwd:.3f} ms")
+        print(f"{name} bwd-only: {bwd:.3f} ms")
+    print()
+
+
+torch.cuda.empty_cache()
 for i in range(10):
-    inputs = torch.randn(B, T, D, device=DEVICE, dtype=DTYPE)
+    inputs = torch.randn(
+        B,
+        T,
+        D,
+        device=DEVICE,
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+
     layers_swiglu = [SwiGLU() for _ in range(L)]
     layers_identity = [Identity() for _ in range(L)]
 
@@ -1305,6 +1446,7 @@ for i in range(10):
         dtype=DTYPE,
         requires_grad=True,
     )
+
     pseudo_queries_randn = torch.randn(
         L + 1,
         D,
@@ -1313,36 +1455,45 @@ for i in range(10):
         requires_grad=True,
     )
 
+    grad_out = torch.randn(
+        B,
+        T,
+        D,
+        device=DEVICE,
+        dtype=DTYPE,
+    )
+
     args_identity = (inputs, pseudo_queries_randn, layers_identity)
 
     args_swiglu_zeros = (inputs, pseudo_queries_zeros, layers_swiglu)
     args_swiglu_randn = (inputs, pseudo_queries_randn, layers_swiglu)
 
-    out_paper_zeros = paper_forward(*args_swiglu_zeros)
-    out_paper_randn = paper_forward(*args_swiglu_randn)
-
-    print(f"mean abs randn paper: {out_paper_zeros.abs().mean()}")
-    print(f"mean abs zeros paper: {out_paper_randn.abs().mean()}")
-
     funcs_to_bench = [
-        ("torch_compile_forward", torch_compile_forward),
+        ("torch_compile_phases_forward", torch_compile_phases_forward),
         ("production_forward", production_forward),
         ("paper_forward", paper_forward),
     ]
+
     random.shuffle(funcs_to_bench)
 
-    for name, func in funcs_to_bench:
-        print(f"{name}: {bench(func, *args_identity)} ms")
+    print_bench_group("identity / randn queries", args_identity)
+    print_bench_group("swiglu / zero queries", args_swiglu_zeros)
+    print_bench_group("swiglu / randn queries", args_swiglu_randn)
 
-        abs_difference_zeros = (out_paper_zeros - func(*args_swiglu_zeros)).abs()
-        abs_difference_randn = (out_paper_randn - func(*args_swiglu_randn)).abs()
+    compare_grads(
+        "paper_forward",
+        paper_forward,
+        "production_forward",
+        production_forward,
+        *args_swiglu_randn,
+        grad_out,
+    )
 
-        print(f"mean abs difference zeros: {abs_difference_zeros.mean()}")
-        print(f"mean abs difference randn: {abs_difference_randn.mean()}")
-        print(
-            f"mean relative difference zeros: {(abs_difference_zeros / (out_paper_zeros.abs() + 1e-3)).mean()}"
-        )
-        print(
-            f"mean relative difference randn: {(abs_difference_randn / (out_paper_randn.abs() + 1e-3)).mean()}"
-        )
-    print()
+    compare_grads(
+        "torch_compile_phases_forward",
+        torch_compile_phases_forward,
+        "production_forward",
+        production_forward,
+        *args_swiglu_randn,
+        grad_out,
+    )
