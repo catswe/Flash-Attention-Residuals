@@ -199,30 +199,6 @@ def phase_2_online_softmax_merge_intrablock(
     )
 
 
-class SwiGLU(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.norm = nn.RMSNorm(D, device=DEVICE, dtype=DTYPE)
-        self.linear1 = nn.Linear(D, D * 2, bias=False, device=DEVICE, dtype=DTYPE)
-        self.linear2 = nn.Linear(D, D, bias=False, device=DEVICE, dtype=DTYPE)
-
-    def forward(self, x):
-        h1, gate = self.linear1(self.norm(x)).chunk(2, dim=-1)
-        return self.linear2(F.silu(gate) * h1)
-
-
-inputs = torch.randn(B, T, D, device=DEVICE, dtype=DTYPE)
-pseudo_queries = torch.randn(
-    L + 1,
-    D,
-    device=DEVICE,
-    dtype=DTYPE,
-    requires_grad=True,
-)
-layers_swiglu = [SwiGLU() for _ in range(L)]
-out = production_forward(inputs, pseudo_queries, layers_swiglu)
-
-
 @triton.autotune(
     configs=autotune_configs,
     key=["NUM_SOURCE_BLOCKS", "HIDDEN_DIM", "NUM_QUERIES_PER_BLOCK", "PADDED_SRC"],
@@ -827,7 +803,7 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
         grad_output = grad_outputs[0]
 
 
-def production_forward_custom_autograd(inputs, pseudo_queries, layers, eps=None):
+def production_forward(inputs, pseudo_queries, layers, eps=None):
     if eps is None:
         eps = torch.finfo(torch.float32).eps
 
@@ -840,3 +816,27 @@ def production_forward_custom_autograd(inputs, pseudo_queries, layers, eps=None)
         eps,
         *flat_layer_params,
     )
+
+
+class SwiGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.RMSNorm(D, device=DEVICE, dtype=DTYPE)
+        self.linear1 = nn.Linear(D, D * 2, bias=False, device=DEVICE, dtype=DTYPE)
+        self.linear2 = nn.Linear(D, D, bias=False, device=DEVICE, dtype=DTYPE)
+
+    def forward(self, x):
+        h1, gate = self.linear1(self.norm(x)).chunk(2, dim=-1)
+        return self.linear2(F.silu(gate) * h1)
+
+
+inputs = torch.randn(B, T, D, device=DEVICE, dtype=DTYPE)
+pseudo_queries = torch.randn(
+    L + 1,
+    D,
+    device=DEVICE,
+    dtype=DTYPE,
+    requires_grad=True,
+)
+layers_swiglu = [SwiGLU() for _ in range(L)]
+out = production_forward(inputs, pseudo_queries, layers_swiglu)
