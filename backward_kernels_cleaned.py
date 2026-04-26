@@ -801,6 +801,337 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_outputs):
         grad_output = grad_outputs[0]
+        if grad_output is None:
+            return (None, None, None, None, *([None] * ctx.num_layer_params))
+
+        block_representations, pseudo_queries = ctx.saved_tensors
+        layers = ctx.layers
+        eps = ctx.eps
+
+        device = block_representations.device
+        block_dtype = block_representations.dtype
+        attn_dtype = torch.bfloat16
+
+        grad_output = grad_output.contiguous()
+
+        layer_param_groups = [tuple(layer.parameters()) for layer in layers]
+        flat_layer_params = [p for group in layer_param_groups for p in group]
+
+        param_offsets = []
+        offset = 0
+        for group in layer_param_groups:
+            param_offsets.append(offset)
+            offset += len(group)
+
+        grad_flat_layer_params = [
+            torch.zeros_like(p, dtype=torch.float32) if p.requires_grad else None
+            for p in flat_layer_params
+        ]
+
+        grad_block_representations = torch.zeros_like(
+            block_representations,
+            dtype=torch.float32,
+        )
+        grad_pseudo_queries = torch.zeros_like(
+            pseudo_queries,
+            dtype=torch.float32,
+        )
+
+        grad_pseudo_queries_partial = torch.empty(
+            BLOCK_SIZE,
+            B,
+            T,
+            D,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        grad_phase2_pseudo_query_partial = torch.empty(
+            B,
+            T,
+            D,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        def run_layer_backward(layer_idx, layer_input_buf, grad_update_f32):
+            params_i = layer_param_groups[layer_idx]
+            active_param_indices = [
+                j for j, p in enumerate(params_i) if p.requires_grad
+            ]
+            active_params = [params_i[j] for j in active_param_indices]
+
+            with torch.enable_grad():
+                layer_input = layer_input_buf.detach().requires_grad_(True)
+                update = layers[layer_idx](layer_input)
+
+                grad_results = torch.autograd.grad(
+                    outputs=update,
+                    inputs=(layer_input, *active_params),
+                    grad_outputs=grad_update_f32.to(dtype=update.dtype),
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True,
+                )
+
+            grad_layer_input = grad_results[0]
+            if grad_layer_input is None:
+                grad_layer_input_f32 = torch.zeros_like(
+                    layer_input_buf,
+                    dtype=torch.float32,
+                )
+            else:
+                grad_layer_input_f32 = grad_layer_input.to(torch.float32).contiguous()
+
+            base = param_offsets[layer_idx]
+            for local_idx, param_grad in zip(active_param_indices, grad_results[1:]):
+                if param_grad is not None:
+                    grad_flat_layer_params[base + local_idx].add_(
+                        param_grad.to(torch.float32)
+                    )
+
+            return grad_layer_input_f32
+
+        final_out_recomputed = torch.empty(
+            1,
+            B,
+            T,
+            D,
+            device=device,
+            dtype=attn_dtype,
+        )
+        final_lse = torch.empty(
+            1,
+            B,
+            T,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        with torch.no_grad():
+            phase_1_batched_interblock_attention(
+                block_representations,
+                pseudo_queries[-1:],
+                final_out_recomputed,
+                final_lse,
+                eps=eps,
+            )
+
+        phase_1_batched_interblock_attention_backward(
+            block_representations,
+            pseudo_queries[-1:],
+            final_lse,
+            grad_output.unsqueeze(0),
+            None,
+            grad_block_representations,
+            grad_pseudo_queries[-1:],
+            grad_pseudo_queries_partial[:1],
+            eps=eps,
+        )
+
+        block_phase1_out_scratch = torch.empty(
+            BLOCK_SIZE,
+            B,
+            T,
+            D,
+            device=device,
+            dtype=attn_dtype,
+        )
+        block_lse_scratch = torch.empty(
+            BLOCK_SIZE,
+            B,
+            T,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        grad_block_phase1_out_scratch = torch.empty(
+            BLOCK_SIZE,
+            B,
+            T,
+            D,
+            device=device,
+            dtype=torch.float32,
+        )
+        grad_block_lse_scratch = torch.empty(
+            BLOCK_SIZE,
+            B,
+            T,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        intrablock_partial_before_scratch = torch.empty(
+            max(BLOCK_SIZE - 1, 1),
+            B,
+            T,
+            D,
+            device=device,
+            dtype=block_dtype,
+        )
+
+        partial_recompute = torch.empty(
+            B,
+            T,
+            D,
+            device=device,
+            dtype=block_dtype,
+        )
+
+        layer_input_tmp = torch.empty(
+            B,
+            T,
+            D,
+            device=device,
+            dtype=attn_dtype,
+        )
+
+        grad_curr_partial = torch.empty(
+            B,
+            T,
+            D,
+            device=device,
+            dtype=torch.float32,
+        )
+        grad_prev_partial = torch.empty_like(grad_curr_partial)
+
+        last_block_start = ((L - 1) // BLOCK_SIZE) * BLOCK_SIZE
+
+        for block_start in range(last_block_start, -1, -BLOCK_SIZE):
+            curr_block_idx = block_start // BLOCK_SIZE + 1
+            num_queries = min(BLOCK_SIZE, L - block_start)
+
+            phase1_out = block_phase1_out_scratch[:num_queries]
+            phase1_lse = block_lse_scratch[:num_queries]
+
+            grad_phase1_out = grad_block_phase1_out_scratch[:num_queries]
+            grad_phase1_lse = grad_block_lse_scratch[:num_queries]
+
+            grad_phase1_out.zero_()
+            grad_phase1_lse.zero_()
+
+            with torch.no_grad():
+                phase_1_batched_interblock_attention(
+                    block_representations[:curr_block_idx],
+                    pseudo_queries[block_start : block_start + num_queries],
+                    phase1_out,
+                    phase1_lse,
+                    eps=eps,
+                )
+
+                for query_offset in range(num_queries):
+                    layer_idx = block_start + query_offset
+
+                    layer_input_tmp.copy_(phase1_out[query_offset])
+
+                    if query_offset != 0:
+                        intrablock_partial_before_scratch[query_offset - 1].copy_(
+                            partial_recompute
+                        )
+
+                        phase_2_online_softmax_merge_intrablock(
+                            intrablock_partial_before_scratch[query_offset - 1],
+                            pseudo_queries[layer_idx],
+                            layer_input_tmp,
+                            phase1_lse[query_offset],
+                            eps=eps,
+                        )
+
+                    update = layers[layer_idx](layer_input_tmp)
+
+                    if query_offset == 0:
+                        partial_recompute.copy_(update)
+                    else:
+                        partial_recompute.add_(update)
+
+            grad_curr_partial.copy_(grad_block_representations[curr_block_idx])
+
+            for query_offset in range(num_queries - 1, -1, -1):
+                layer_idx = block_start + query_offset
+
+                with torch.no_grad():
+                    layer_input_tmp.copy_(phase1_out[query_offset])
+
+                    if query_offset != 0:
+                        phase_2_online_softmax_merge_intrablock(
+                            intrablock_partial_before_scratch[query_offset - 1],
+                            pseudo_queries[layer_idx],
+                            layer_input_tmp,
+                            phase1_lse[query_offset],
+                            eps=eps,
+                        )
+
+                grad_layer_input = run_layer_backward(
+                    layer_idx,
+                    layer_input_tmp,
+                    grad_curr_partial,
+                )
+
+                if query_offset == 0:
+                    grad_phase1_out[query_offset].copy_(grad_layer_input)
+                else:
+                    grad_prev_partial.copy_(grad_curr_partial)
+
+                    phase_2_online_softmax_merge_intrablock_backward(
+                        intrablock_partial_before_scratch[query_offset - 1],
+                        pseudo_queries[layer_idx],
+                        phase1_out[query_offset],
+                        phase1_lse[query_offset],
+                        grad_layer_input,
+                        grad_prev_partial,
+                        grad_pseudo_queries[layer_idx],
+                        grad_phase1_out[query_offset],
+                        grad_phase1_lse[query_offset],
+                        grad_phase2_pseudo_query_partial,
+                        eps=eps,
+                    )
+
+                    grad_curr_partial, grad_prev_partial = (
+                        grad_prev_partial,
+                        grad_curr_partial,
+                    )
+
+            phase_1_batched_interblock_attention_backward(
+                block_representations[:curr_block_idx],
+                pseudo_queries[block_start : block_start + num_queries],
+                phase1_lse,
+                grad_phase1_out,
+                grad_phase1_lse,
+                grad_block_representations[:curr_block_idx],
+                grad_pseudo_queries[block_start : block_start + num_queries],
+                grad_pseudo_queries_partial[:num_queries],
+                eps=eps,
+            )
+
+        grad_inputs = (
+            grad_block_representations[0].to(block_dtype)
+            if ctx.needs_input_grad[0]
+            else None
+        )
+
+        grad_pseudo_queries_out = (
+            grad_pseudo_queries.to(pseudo_queries.dtype)
+            if ctx.needs_input_grad[1]
+            else None
+        )
+
+        grad_flat_layer_params_out = []
+        for j, (param, grad_param) in enumerate(
+            zip(flat_layer_params, grad_flat_layer_params)
+        ):
+            needs_grad = ctx.needs_input_grad[4 + j]
+            if not needs_grad or grad_param is None:
+                grad_flat_layer_params_out.append(None)
+            else:
+                grad_flat_layer_params_out.append(grad_param.to(param.dtype))
+
+        return (
+            grad_inputs,
+            grad_pseudo_queries_out,
+            None,
+            None,
+            *grad_flat_layer_params_out,
+        )
 
 
 def production_forward(inputs, pseudo_queries, layers, eps=None):
