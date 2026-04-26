@@ -212,59 +212,6 @@ def phase_2_online_softmax_merge_intrablock(
     )
 
 
-def production_forward(inputs, pseudo_queries, layers):
-    block_representations = torch.zeros(
-        NUM_BLOCKS,
-        B,
-        T,
-        D,
-        device=DEVICE,
-        dtype=inputs.dtype,
-    )
-    block_representations[0] = inputs
-
-    attn_out = torch.empty(
-        (L + 1, B, T, D),
-        dtype=torch.bfloat16,
-        device=DEVICE,
-    )
-    attn_lse = torch.empty(
-        (L + 1, B, T),
-        dtype=torch.float32,
-        device=DEVICE,
-    )
-
-    for i in range(L):
-        curr_block_idx = i // BLOCK_SIZE + 1
-
-        if i % BLOCK_SIZE == 0:
-            num_queries = min(BLOCK_SIZE, L - i)
-
-            phase_1_batched_interblock_attention(
-                block_representations[:curr_block_idx],
-                pseudo_queries[i : i + num_queries],
-                attn_out[i : i + num_queries],
-                attn_lse[i : i + num_queries],
-            )
-        else:
-            phase_2_online_softmax_merge_intrablock(
-                block_representations[curr_block_idx],
-                pseudo_queries[i],
-                attn_out[i],
-                attn_lse[i],
-            )
-
-        block_representations[curr_block_idx] += layers[i](attn_out[i])
-
-    phase_1_batched_interblock_attention(
-        block_representations,
-        pseudo_queries[-1:],
-        attn_out[-1:],
-        attn_lse[-1:],
-    )
-    return attn_out[-1]
-
-
 class SwiGLU(nn.Module):
     def __init__(self):
         super().__init__()
@@ -311,6 +258,7 @@ def phase_1_batched_interblock_attention_backward_kernel(
     HIDDEN_DIM: tl.constexpr,
     NUM_QUERIES_PER_BLOCK: tl.constexpr,
     PADDED_SRC: tl.constexpr,
+    HAS_GRAD_LSE: tl.constexpr,
 ):
     batch_seq_idx = tl.program_id(0)
 
@@ -349,9 +297,12 @@ def phase_1_batched_interblock_attention_backward_kernel(
             + hidden_dim_range_1d,
         ).to(tl.float32)
 
-        grad_logsumexp = tl.load(grad_lse_ptr + layer_offset * BT + batch_seq_idx).to(
-            tl.float32
-        )
+        if HAS_GRAD_LSE:
+            grad_logsumexp = tl.load(
+                grad_lse_ptr + layer_offset * BT + batch_seq_idx
+            ).to(tl.float32)
+        else:
+            grad_logsumexp = 0.0
 
         forward_logsumexp = tl.load(lse_ptr + layer_offset * BT + batch_seq_idx).to(
             tl.float32
@@ -517,8 +468,9 @@ def phase_1_batched_interblock_attention_backward(
     if eps is None:
         eps = torch.finfo(torch.float32).eps
 
+    has_grad_lses = grad_lses is not None
     if grad_lses is None:
-        grad_lses = torch.zeros_like(lses)
+        grad_lses = lses
 
     phase_1_batched_interblock_attention_backward_kernel[(BT,)](
         block_representations,
@@ -534,6 +486,7 @@ def phase_1_batched_interblock_attention_backward(
         D,
         NUM_QUERIES,
         triton.next_power_of_2(NUM_SOURCE_BLOCKS),
+        has_grad_lses,
     )
 
     phase_1_reduce_grad_pseudo_queries_kernel[
@@ -799,7 +752,7 @@ def phase_2_online_softmax_merge_intrablock_backward(
 class BlockwiseAttentionFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inputs, pseudo_queries, layers, eps, *flat_layer_params):
-        block_representations = torch.zeros(
+        block_representations = torch.empty(
             NUM_BLOCKS,
             B,
             T,
@@ -809,8 +762,17 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
         )
         block_representations[0].copy_(inputs)
 
-        attn_lse = torch.empty(
-            L + 1,
+        block_attn_out_scratch = torch.empty(
+            BLOCK_SIZE,
+            B,
+            T,
+            D,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+
+        block_lse_scratch = torch.empty(
+            BLOCK_SIZE,
             B,
             T,
             device=DEVICE,
@@ -821,38 +783,37 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
             curr_block_idx = block_start // BLOCK_SIZE + 1
             num_queries = min(BLOCK_SIZE, L - block_start)
 
-            block_attn_out = torch.empty(
-                num_queries,
-                B,
-                T,
-                D,
-                device=DEVICE,
-                dtype=torch.bfloat16,
-            )
+            block_attn_out = block_attn_out_scratch[:num_queries]
+            block_lse = block_lse_scratch[:num_queries]
 
             phase_1_batched_interblock_attention(
                 block_representations[:curr_block_idx],
                 pseudo_queries[block_start : block_start + num_queries],
                 block_attn_out,
-                attn_lse[block_start : block_start + num_queries],
+                block_lse,
                 eps=eps,
             )
+
+            curr_block = block_representations[curr_block_idx]
 
             for query_offset in range(num_queries):
                 i = block_start + query_offset
 
                 if query_offset != 0:
                     phase_2_online_softmax_merge_intrablock(
-                        block_representations[curr_block_idx],
+                        curr_block,
                         pseudo_queries[i],
                         block_attn_out[query_offset],
-                        attn_lse[i],
+                        block_lse[query_offset],
                         eps=eps,
                     )
 
-                block_representations[curr_block_idx].add_(
-                    layers[i](block_attn_out[query_offset])
-                )
+                update = layers[i](block_attn_out[query_offset])
+
+                if query_offset == 0:
+                    curr_block.copy_(update)
+                else:
+                    curr_block.add_(update)
 
         final_out = torch.empty(
             B,
@@ -862,18 +823,25 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
             dtype=inputs.dtype,
         )
 
+        final_lse_scratch = torch.empty(
+            1,
+            B,
+            T,
+            device=DEVICE,
+            dtype=torch.float32,
+        )
+
         phase_1_batched_interblock_attention(
             block_representations,
             pseudo_queries[-1:],
             final_out.unsqueeze(0),
-            attn_lse[-1:],
+            final_lse_scratch,
             eps=eps,
         )
 
         ctx.save_for_backward(
             block_representations,
             pseudo_queries,
-            *flat_layer_params,
         )
         ctx.layers = layers
         ctx.eps = eps
