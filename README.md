@@ -5,6 +5,7 @@
 Thanks to Mohamed Osman (https://github.com/spaghettiSystems) and Cartesia for advising on and supporting the development of this kernel.
 
 <!-- TODO: -->
+<!-- - Figure out first block phase 1 special case redundant computation output -->
 <!-- - Determine redundant store -->
 <!-- - Consider "phase_2_online_softmax_merge_intrablock_backward_kernel probably does not need atomic_add" -->
 <!-- - Consider two-phase reduction -->
