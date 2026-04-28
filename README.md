@@ -1,4 +1,4 @@
-## Flash Attention Residuals
+## In Development
 
 > **1.4x faster inference/training** vs. an optimized torch.compile impl. of the paper’s two-phase batched attention with online softmax
 
