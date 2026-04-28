@@ -418,7 +418,7 @@ for i in range(10):
             device=DEVICE,
             dtype=DTYPE,
             requires_grad=not FORWARD_ONLY,
-        )
+        ) / math.sqrt(D)
 
         args_identity = (inputs, pseudo_queries_randn, layers_identity)
 
