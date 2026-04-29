@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import random
 import time
@@ -8,6 +10,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 import os
+
+from typing import Tuple
+from torch.library import triton_op, wrap_triton
+
 
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
@@ -134,16 +140,14 @@ def phase_1_batched_interblock_attention(
 @triton.autotune(
     configs=autotune_configs,
     key=["HIDDEN_DIM"],
-    restore_value=[
-        "interblock_normalized_output_ptr",
-    ],
 )
 @triton.jit
-def phase_2_online_softmax_merge_intrablock_kernel(
+def phase_2_online_softmax_merge_intrablock_out_kernel(
     intrablock_partial_sum_ptr,
     pseudo_query_ptr,
     interblock_normalized_output_ptr,
     interblock_lse_ptr,
+    merged_output_ptr,
     eps,
     HIDDEN_DIM: tl.constexpr,
 ):
@@ -178,28 +182,28 @@ def phase_2_online_softmax_merge_intrablock_kernel(
     ) / exp_sum
 
     tl.store(
-        interblock_normalized_output_ptr
-        + batch_seq_idx * HIDDEN_DIM
-        + hidden_dim_range,
+        merged_output_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range,
         merged_output.to(tl.bfloat16),
     )
 
 
-def phase_2_online_softmax_merge_intrablock(
+def phase_2_online_softmax_merge_intrablock_out(
     intrablock_partial_sum,
     pseudo_query,
     interblock_normalized_output,
     interblock_lse,
+    merged_output,
     eps=None,
 ):
     if eps is None:
         eps = EPS
 
-    phase_2_online_softmax_merge_intrablock_kernel[(BT,)](
+    phase_2_online_softmax_merge_intrablock_out_kernel[(BT,)](
         intrablock_partial_sum,
         pseudo_query,
         interblock_normalized_output,
         interblock_lse,
+        merged_output,
         eps,
         D,
     )
@@ -712,83 +716,6 @@ def phase_2_online_softmax_merge_intrablock_backward(
         grad_pseudo_query_partial,
         grad_pseudo_query,
         BT,
-        D,
-    )
-
-
-@triton.autotune(
-    configs=autotune_configs,
-    key=["HIDDEN_DIM"],
-)
-@triton.jit
-def phase_2_online_softmax_merge_intrablock_out_kernel(
-    intrablock_partial_sum_ptr,
-    pseudo_query_ptr,
-    interblock_normalized_output_ptr,
-    interblock_lse_ptr,
-    merged_output_ptr,
-    eps,
-    HIDDEN_DIM: tl.constexpr,
-):
-    batch_seq_idx = tl.program_id(0)
-    hidden_dim_range = tl.arange(0, HIDDEN_DIM)
-
-    intrablock_partial_sum = tl.load(
-        intrablock_partial_sum_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range
-    ).to(tl.float32)
-
-    pseudo_query_vector = tl.load(
-        pseudo_query_ptr + hidden_dim_range,
-        eviction_policy="evict_last",
-    ).to(tl.float32)
-
-    interblock_lse = tl.load(interblock_lse_ptr + batch_seq_idx).to(tl.float32)
-
-    interblock_normalized_output = tl.load(
-        interblock_normalized_output_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range
-    ).to(tl.float32)
-
-    squared_norm_sum = tl.sum(intrablock_partial_sum * intrablock_partial_sum)
-    inverse_rms_norm = tl.rsqrt(squared_norm_sum / float(HIDDEN_DIM) + eps)
-
-    intrablock_logit = (
-        tl.sum(intrablock_partial_sum * pseudo_query_vector) * inverse_rms_norm
-    )
-
-    merged_max = tl.maximum(interblock_lse, intrablock_logit)
-    interblock_weight = tl.exp(interblock_lse - merged_max)
-    intrablock_weight = tl.exp(intrablock_logit - merged_max)
-    exp_sum = interblock_weight + intrablock_weight
-
-    merged_output = (
-        interblock_weight * interblock_normalized_output
-        + intrablock_weight * intrablock_partial_sum
-    ) / exp_sum
-
-    tl.store(
-        merged_output_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range,
-        merged_output.to(tl.bfloat16),
-    )
-
-
-def phase_2_online_softmax_merge_intrablock_out(
-    intrablock_partial_sum,
-    pseudo_query,
-    interblock_normalized_output,
-    interblock_lse,
-    merged_output,
-    eps=None,
-):
-    if eps is None:
-        eps = EPS
-
-    phase_2_online_softmax_merge_intrablock_out_kernel[(BT,)](
-        intrablock_partial_sum,
-        pseudo_query,
-        interblock_normalized_output,
-        interblock_lse,
-        merged_output,
-        eps,
         D,
     )
 
@@ -1543,8 +1470,7 @@ def bench_backward_only(
     return total / runs * 1000
 
 
-def print_bench_group(title, args):
-    print(title)
+def print_bench_group(args):
     for name, func in funcs_to_bench:
         fwd_bwd = bench_fwd_bwd(func, *args, grad_out)
         bwd = bench_backward_only(func, *args, grad_out)
@@ -1578,14 +1504,6 @@ for i in range(10):
     layers_swiglu = [SwiGLU() for _ in range(L)]
     layers_identity = [Identity() for _ in range(L)]
 
-    pseudo_queries_zeros = torch.zeros(
-        L + 1,
-        D,
-        device=DEVICE,
-        dtype=DTYPE,
-        requires_grad=True,
-    )
-
     pseudo_queries_randn = torch.randn(
         L + 1,
         D,
@@ -1603,18 +1521,20 @@ for i in range(10):
     )
 
     args_swiglu_randn = (inputs, pseudo_queries_randn, layers_swiglu)
-    args_identity_randn = (inputs, pseudo_queries_zeros, layers_identity)
+    args_identity_randn = (inputs, pseudo_queries_randn, layers_identity)
 
     funcs_to_bench = [
         ("torch_compile_phases_forward", torch_compile_phases_forward),
         ("production_forward", production_forward),
         ("paper_forward", paper_forward),
+        ("triton_ops_forward", triton_ops_forward),
     ]
 
     random.shuffle(funcs_to_bench)
 
-    print_bench_group("identity layers + randn queries", args_identity_randn)
-    
+    print("identity layers + randn queries")
+    print_bench_group(args_identity_randn)
+
     print("grads check for swiglu layers + randn queries")
     compare_grads(
         "paper_forward",
@@ -1624,12 +1544,19 @@ for i in range(10):
         *args_swiglu_randn,
         grad_out,
     )
-
     compare_grads(
         "paper_forward",
         paper_forward,
         "torch_compile_phases_forward",
         torch_compile_phases_forward,
+        *args_swiglu_randn,
+        grad_out,
+    )
+    compare_grads(
+        "paper_forward",
+        paper_forward,
+        "triton_ops_forward",
+        triton_ops_forward,
         *args_swiglu_randn,
         grad_out,
     )
