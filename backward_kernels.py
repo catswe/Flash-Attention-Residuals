@@ -187,26 +187,34 @@ def phase_2_online_softmax_merge_intrablock_out_kernel(
     )
 
 
-def phase_2_online_softmax_merge_intrablock_out(
-    intrablock_partial_sum,
-    pseudo_query,
-    interblock_normalized_output,
-    interblock_lse,
-    merged_output,
-    eps=None,
-):
-    if eps is None:
-        eps = EPS
+@triton_op("blockwise_attn::phase_2_online_softmax_merge_intrablock", mutates_args={})
+def phase_2_online_softmax_merge_intrablock(
+    intrablock_partial_sum: torch.Tensor,
+    pseudo_query: torch.Tensor,
+    interblock_normalized_output: torch.Tensor,
+    interblock_lse: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    B_, T_, D_ = intrablock_partial_sum.shape
+    BT_ = B_ * T_
 
-    phase_2_online_softmax_merge_intrablock_out_kernel[(BT,)](
+    merged_output = torch.empty(
+        (B_, T_, D_),
+        device=interblock_normalized_output.device,
+        dtype=interblock_normalized_output.dtype,
+    )
+
+    wrap_triton(phase_2_online_softmax_merge_intrablock_out_kernel)[(BT_,)](
         intrablock_partial_sum,
         pseudo_query,
         interblock_normalized_output,
         interblock_lse,
         merged_output,
         eps,
-        D,
+        D_,
     )
+
+    return merged_output
 
 
 @triton.autotune(
@@ -750,14 +758,6 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
             dtype=torch.float32,
         )
 
-        layer_input_tmp = torch.empty(
-            B,
-            T,
-            D,
-            device=DEVICE,
-            dtype=torch.bfloat16,
-        )
-
         for block_start in range(0, L, BLOCK_SIZE):
             curr_block_idx = block_start // BLOCK_SIZE + 1
             num_queries = min(BLOCK_SIZE, L - block_start)
@@ -781,15 +781,13 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
                 if query_offset == 0:
                     layer_input = block_attn_out[query_offset]
                 else:
-                    phase_2_online_softmax_merge_intrablock_out(
+                    layer_input = phase_2_online_softmax_merge_intrablock(
                         curr_block,
                         pseudo_queries[i],
                         block_attn_out[query_offset],
                         block_lse[query_offset],
-                        layer_input_tmp,
-                        eps=eps,
+                        eps,
                     )
-                    layer_input = layer_input_tmp
 
                 update = layers[i](layer_input)
 
@@ -1001,15 +999,6 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
             dtype=block_dtype,
         )
 
-        block_layer_input_scratch = torch.empty(
-            max(BLOCK_SIZE - 1, 1),
-            B,
-            T,
-            D,
-            device=device,
-            dtype=attn_dtype,
-        )
-
         last_block_start = ((L - 1) // BLOCK_SIZE) * BLOCK_SIZE
 
         for block_start in range(last_block_start, -1, -BLOCK_SIZE):
@@ -1045,16 +1034,15 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
                     partial_before = intrablock_partial_before_scratch[query_offset - 1]
                     partial_before.copy_(partial_recompute)
 
-                    layer_input_recomputed = block_layer_input_scratch[query_offset - 1]
-
                     with torch.no_grad():
-                        phase_2_online_softmax_merge_intrablock_out(
-                            partial_before,
-                            pseudo_queries[layer_idx],
-                            phase1_out[query_offset],
-                            phase1_lse[query_offset],
-                            layer_input_recomputed,
-                            eps=eps,
+                        layer_input_recomputed = (
+                            phase_2_online_softmax_merge_intrablock(
+                                partial_before,
+                                pseudo_queries[layer_idx],
+                                phase1_out[query_offset],
+                                phase1_lse[query_offset],
+                                eps,
+                            )
                         )
 
                 with torch.enable_grad():
@@ -1076,11 +1064,6 @@ class BlockwiseAttentionFunction(torch.autograd.Function):
 
             for query_offset in range(num_queries - 1, -1, -1):
                 layer_idx = block_start + query_offset
-
-                if query_offset == 0:
-                    layer_input_recomputed = phase1_out[query_offset]
-                else:
-                    layer_input_recomputed = block_layer_input_scratch[query_offset - 1]
 
                 grad_layer_input = run_saved_layer_backward(
                     layer_idx,
@@ -1164,7 +1147,7 @@ def production_forward(inputs, pseudo_queries, layers, eps=None):
     )
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs")
+@torch.compile(mode="max-autotune")
 def naive_attention_residual(pseudo_query, values):
     keys = F.rms_norm(values, (values.shape[-1],), eps=EPS)
 
@@ -1203,7 +1186,7 @@ def paper_forward(inputs, pseudo_queries, layers):
     )
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs")
+@torch.compile(mode="max-autotune")
 def phase_1_fn(query, value):
     query = query.to(torch.float32)
     value = value.to(torch.float32)
@@ -1228,7 +1211,7 @@ def phase_1_fn(query, value):
     return lse, normalized.to(torch.bfloat16), h
 
 
-@torch.compile(mode="max-autotune-no-cudagraphs")
+@torch.compile(mode="max-autotune")
 def phase_2_fn(current_block_values, query_vector, prev_lse, prev_normalized):
     query_vector_f32 = query_vector.to(torch.float32)
     prev_normalized_f32 = prev_normalized.to(torch.float32)
@@ -1526,8 +1509,8 @@ for i in range(10):
     funcs_to_bench = [
         ("torch_compile_phases_forward", torch_compile_phases_forward),
         ("production_forward", production_forward),
+        ("production_forward2", production_forward2),
         ("paper_forward", paper_forward),
-        ("triton_ops_forward", triton_ops_forward),
     ]
 
     random.shuffle(funcs_to_bench)
@@ -1555,8 +1538,8 @@ for i in range(10):
     compare_grads(
         "paper_forward",
         paper_forward,
-        "triton_ops_forward",
-        triton_ops_forward,
+        "production_forward2",
+        production_forward2,
         *args_swiglu_randn,
         grad_out,
     )
