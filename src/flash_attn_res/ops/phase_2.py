@@ -49,7 +49,7 @@ def _online_softmax_merge_backward_triton_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, D = intrablock_partial_sum.shape
 
-    grad_intrablock_partial_sum = torch.zeros(
+    grad_intrablock_partial_sum = torch.empty(
         (B, T, D),
         device=intrablock_partial_sum.device,
         dtype=torch.float32,
@@ -84,6 +84,7 @@ def _online_softmax_merge_backward_triton_op(
         grad_phase1_interblock_normalized_output,
         grad_phase1_interblock_logsumexp,
         eps=eps,
+        accumulate_grad_intrablock=False,
     )
 
     return (
@@ -105,6 +106,7 @@ def _online_softmax_merge_backward_accumulate(
     grad_phase1_interblock_normalized_output: torch.Tensor,
     grad_phase1_interblock_logsumexp: torch.Tensor,
     eps: float,
+    accumulate_grad_intrablock: bool,
 ) -> None:
     B, T, D = intrablock_partial_sum.shape
     BT = B * T
@@ -124,6 +126,7 @@ def _online_softmax_merge_backward_accumulate(
         eps,
         BT,
         D,
+        accumulate_grad_intrablock,
     )
 
 

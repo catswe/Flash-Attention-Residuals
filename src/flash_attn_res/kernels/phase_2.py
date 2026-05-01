@@ -76,6 +76,7 @@ def phase_2_online_softmax_merge_backward_kernel(
     BT: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     BLOCK_BT: tl.constexpr,
+    ACCUMULATE_GRAD_INTRABLOCK: tl.constexpr,
 ):
     bt_block_idx = tl.program_id(0)
 
@@ -195,15 +196,18 @@ def phase_2_online_softmax_merge_backward_kernel(
 
     grad_intrablock_ptr = grad_intrablock_partial_sum_accumulator_ptr + offsets_2d
 
-    prev_grad_intrablock = tl.load(
-        grad_intrablock_ptr,
-        mask=mask_2d,
-        other=0.0,
-    ).to(tl.float32)
+    if ACCUMULATE_GRAD_INTRABLOCK:
+        prev_grad_intrablock = tl.load(
+            grad_intrablock_ptr,
+            mask=mask_2d,
+            other=0.0,
+        ).to(tl.float32)
+
+        grad_intrablock_partial_sum += prev_grad_intrablock
 
     tl.store(
         grad_intrablock_ptr,
-        prev_grad_intrablock + grad_intrablock_partial_sum,
+        grad_intrablock_partial_sum,
         mask=mask_2d,
     )
 

@@ -101,6 +101,7 @@ def phase_1_batched_attention_backward_kernel(
     NUM_QUERIES_PER_BLOCK: tl.constexpr,
     PADDED_SRC: tl.constexpr,
     HAS_GRAD_LSE: tl.constexpr,
+    ACCUMULATE_GRAD_BLOCKS: tl.constexpr
 ):
     batch_seq_idx = tl.program_id(0)
 
@@ -227,14 +228,17 @@ def phase_1_batched_attention_backward_kernel(
         + hidden_dim_range
     )
 
-    prev_grad_block = tl.load(
-        grad_block_ptr,
-        mask=valid_block_mask_2d,
-        other=0.0,
-    ).to(tl.float32)
+    if ACCUMULATE_GRAD_BLOCKS:
+        prev_grad_block = tl.load(
+            grad_block_ptr,
+            mask=valid_block_mask_2d,
+            other=0.0,
+        ).to(tl.float32)
+
+        grad_source_accumulator += prev_grad_block
 
     tl.store(
         grad_block_ptr,
-        prev_grad_block + grad_source_accumulator,
+        grad_source_accumulator,
         mask=valid_block_mask_2d,
     )

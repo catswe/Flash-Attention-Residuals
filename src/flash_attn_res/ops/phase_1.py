@@ -64,7 +64,7 @@ def _batched_attention_backward_triton_op(
     num_queries = pseudo_queries.shape[0]
     B, T, D = block_representations.shape[1:]
 
-    grad_block_representations = torch.zeros(
+    grad_block_representations = torch.empty(
         (num_source_blocks, B, T, D),
         device=block_representations.device,
         dtype=torch.float32,
@@ -92,21 +92,23 @@ def _batched_attention_backward_triton_op(
         grad_pseudo_queries,
         grad_pseudo_queries_partial,
         eps,
+        False,
     )
 
     return grad_block_representations, grad_pseudo_queries
 
 
 def _batched_attention_backward_accumulate(
-    block_representations: torch.Tensor,
-    pseudo_queries: torch.Tensor,
-    lses: torch.Tensor,
-    grad_softmax_outputs: torch.Tensor,
-    grad_lses: torch.Tensor | None,
-    grad_block_representations: torch.Tensor,
-    grad_pseudo_queries: torch.Tensor,
-    grad_pseudo_queries_partial: torch.Tensor,
-    eps: float,
+    block_representations,
+    pseudo_queries,
+    lses,
+    grad_softmax_outputs,
+    grad_lses,
+    grad_block_representations,
+    grad_pseudo_queries,
+    grad_pseudo_queries_partial,
+    eps,
+    accumulate_grad_blocks,
 ) -> None:
     num_source_blocks = block_representations.shape[0]
     num_queries = pseudo_queries.shape[0]
@@ -133,6 +135,7 @@ def _batched_attention_backward_accumulate(
         num_queries,
         triton.next_power_of_2(num_source_blocks),
         has_grad_lses,
+        accumulate_grad_blocks,
     )
 
     wrap_triton(reduce_grad_queries_kernel)[

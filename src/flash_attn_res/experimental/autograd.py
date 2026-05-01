@@ -113,7 +113,7 @@ class BlockAttentionResiduals(torch.autograd.Function):
             for p in flat_layer_params
         ]
 
-        grad_block_representations = torch.zeros_like(
+        grad_block_representations = torch.empty_like(
             block_representations,
             dtype=torch.bfloat16,
         )
@@ -168,6 +168,7 @@ class BlockAttentionResiduals(torch.autograd.Function):
             grad_pseudo_queries[-1:],
             grad_pseudo_queries_partial_final,
             eps=eps,
+            accumulate_grad_blocks=False,
         )
 
         del grad_pseudo_queries_partial_final
@@ -284,6 +285,7 @@ class BlockAttentionResiduals(torch.autograd.Function):
                         grad_phase1_out[query_offset],
                         grad_phase1_lse[query_offset],
                         eps=eps,
+                        accumulate_grad_intrablock=True,
                     )
 
                 del grad_layer_input
@@ -304,6 +306,7 @@ class BlockAttentionResiduals(torch.autograd.Function):
                 grad_pseudo_queries[block_start : block_start + num_queries],
                 grad_phase1_out,
                 eps=eps,
+                accumulate_grad_blocks=True,
             )
 
             del phase1_lse
