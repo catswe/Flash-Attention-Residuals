@@ -1,6 +1,6 @@
 ## Flash Attention Residuals
 
-> **1.4x faster inference/training** vs. torch.compile implement. of the paper’s batched attention + online softmax
+> **1.4x faster inference/training** vs. torch.compile impl. of the paper’s two-phase batched attn. + online softmax
 
 > **20% reduction in training memory** (without activation checkpointing)*
 
@@ -29,11 +29,11 @@ See `src` and `examples` folders.
 <!-- - Consider two-phase reduction -->
 
 ## Roadmap:
-- CuTE, CUDA, and other DSLs implementation
-- Tune precision
+- More robust autograd impl.
+- Precision tuning
 - Mixed FP16 and BF16 and store quantization scale
 - Stochastic rounding
-- Make into Python package
+- CuTE, CUDA, and other DSLs implementation
 
 ## Development Notes:
 - Normalizing in phase 1 keeps outputs bounded (convex combination of values) so bf16 error doesn't scale with softmax flatness. Phase 2 computes in fp32, and the reduction algebra matches split-KV Flash Attention.
