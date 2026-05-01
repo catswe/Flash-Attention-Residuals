@@ -19,7 +19,7 @@ pip install flash-attn-res
 
 ## Usage
 This package contains Triton kernels, `triton_op` wrappers compatible with torch.compile, and an experimental high-performance Block AttenRes autograd implementation.
-See `src` and `examples` folders.
+See `src` and `benchmarks` folders.
 
 
 <!-- TODO: -->
@@ -29,6 +29,8 @@ See `src` and `examples` folders.
 <!-- - Consider two-phase reduction -->
 
 ## Roadmap:
+- Better autotuning defaults
+- Better benchmarks
 - More robust autograd impl.
 - Precision tuning
 - Mixed FP16 and BF16 and store quantization scale

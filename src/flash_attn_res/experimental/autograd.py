@@ -5,7 +5,7 @@ from ..ops import phase_1
 from ..ops import phase_2
 
 
-class BlockwiseAttentionFunction(torch.autograd.Function):
+class BlockAttentionResiduals(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx, inputs, pseudo_queries, layers, BLOCK_SIZE, eps, *flat_layer_params
