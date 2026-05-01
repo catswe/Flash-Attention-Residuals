@@ -190,6 +190,14 @@ class BlockAttentionResiduals(torch.autograd.Function):
 
         last_block_start = ((L - 1) // BLOCK_SIZE) * BLOCK_SIZE
 
+        partial_recompute = torch.empty(
+            B,
+            T,
+            D,
+            device=device,
+            dtype=block_dtype,
+        )
+
         for block_start in range(last_block_start, -1, -BLOCK_SIZE):
             curr_block_idx = block_start // BLOCK_SIZE + 1
             num_queries = min(BLOCK_SIZE, L - block_start)
@@ -203,21 +211,11 @@ class BlockAttentionResiduals(torch.autograd.Function):
             layer_update_list = []
 
             with torch.no_grad():
-                phase1_out, phase1_lse = (
-                    phase_1.phase_1_batched_attention_triton_op(
-                        block_representations[:curr_block_idx],
-                        pseudo_queries[block_start : block_start + num_queries],
-                        eps,
-                    )
+                phase1_out, phase1_lse = phase_1.phase_1_batched_attention_triton_op(
+                    block_representations[:curr_block_idx],
+                    pseudo_queries[block_start : block_start + num_queries],
+                    eps,
                 )
-
-            partial_recompute = torch.empty(
-                B,
-                T,
-                D,
-                device=device,
-                dtype=block_dtype,
-            )
 
             for query_offset in range(num_queries):
                 layer_idx = block_start + query_offset
