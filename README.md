@@ -29,8 +29,7 @@ See `src` and `examples` folders.
 <!-- - Consider two-phase reduction -->
 
 ## Roadmap:
-- Proper backward eval
-- Implement in CuTE and CUDA
+- CuTE, CUDA, and other DSLs implementation
 - Tune precision
 - Mixed FP16 and BF16 and store quantization scale
 - Stochastic rounding
