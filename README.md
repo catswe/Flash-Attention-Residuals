@@ -17,6 +17,9 @@ Thanks to Mohamed Osman (https://github.com/spaghettiSystems) and Cartesia for a
 pip install flash-attn-res
 ```
 
+## Usage
+This package contains Triton kernels, `triton_op` wrappers compatible with torch.compile, and an experimental high-performance Block AttenRes autograd implementation.
+See `src` and `examples` folders.
 
 
 <!-- TODO: -->
