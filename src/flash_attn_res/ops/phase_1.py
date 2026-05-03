@@ -8,12 +8,15 @@ from ..kernels.reduce import reduce_grad_queries_kernel
 EPS = torch.finfo(torch.float32).eps
 
 
-@triton_op("flash_attn_res::phase_1_batched_attention_forward", mutates_args={})
-def phase_1_batched_attention_triton_op(
+@triton_op(
+    "flash_attn_res::_phase_1_batched_attention_forward_with_aux",
+    mutates_args={},
+)
+def _phase_1_batched_attention_forward_with_aux_triton_op(
     block_representations: torch.Tensor,
     pseudo_queries: torch.Tensor,
     eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_source_blocks = block_representations.shape[0]
     num_queries = pseudo_queries.shape[0]
     B, T, D = block_representations.shape[1:]
@@ -31,11 +34,25 @@ def phase_1_batched_attention_triton_op(
         dtype=torch.float32,
     )
 
+    inverse_rms_norms = torch.empty(
+        (B, T, num_source_blocks),
+        device=block_representations.device,
+        dtype=torch.float32,
+    )
+
+    attention_logits = torch.empty(
+        (num_queries, B, T, num_source_blocks),
+        device=block_representations.device,
+        dtype=torch.float32,
+    )
+
     wrap_triton(phase_1.phase_1_batched_attention_forward_kernel)[(BT,)](
         block_representations,
         pseudo_queries,
         softmax_outputs,
         lses,
+        inverse_rms_norms,
+        attention_logits,
         eps,
         num_source_blocks,
         BT,
@@ -44,6 +61,21 @@ def phase_1_batched_attention_triton_op(
         triton.next_power_of_2(num_source_blocks),
     )
 
+    return softmax_outputs, lses, inverse_rms_norms, attention_logits
+
+
+def phase_1_batched_attention_triton_op(
+    block_representations: torch.Tensor,
+    pseudo_queries: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    softmax_outputs, lses, _inverse_rms_norms, _attention_logits = (
+        _phase_1_batched_attention_forward_with_aux_triton_op(
+            block_representations,
+            pseudo_queries,
+            eps,
+        )
+    )
     return softmax_outputs, lses
 
 
@@ -55,6 +87,8 @@ def _batched_attention_backward_triton_op(
     block_representations: torch.Tensor,
     pseudo_queries: torch.Tensor,
     lses: torch.Tensor,
+    inverse_rms_norms: torch.Tensor,
+    attention_logits: torch.Tensor,
     grad_softmax_outputs: torch.Tensor,
     grad_lses: torch.Tensor,
     has_grad_lses: bool,
@@ -93,6 +127,8 @@ def _batched_attention_backward_triton_op(
         grad_pseudo_queries_partial,
         eps,
         False,
+        inverse_rms_norms,
+        attention_logits,
     )
 
     return grad_block_representations, grad_pseudo_queries
@@ -109,6 +145,8 @@ def _batched_attention_backward_accumulate(
     grad_pseudo_queries_partial,
     eps,
     accumulate_grad_blocks,
+    inverse_rms_norms,
+    attention_logits,
 ) -> None:
     num_source_blocks = block_representations.shape[0]
     num_queries = pseudo_queries.shape[0]
@@ -124,6 +162,8 @@ def _batched_attention_backward_accumulate(
         block_representations,
         pseudo_queries,
         lses,
+        inverse_rms_norms,
+        attention_logits,
         grad_softmax_outputs,
         grad_lses,
         grad_block_representations,
@@ -154,18 +194,32 @@ def _batched_attention_backward_accumulate(
 
 def setup_context(ctx, inputs, output):
     block_representations, pseudo_queries, eps = inputs
-    _softmax_outputs, lses = output
+    _softmax_outputs, lses, inverse_rms_norms, attention_logits = output
 
     ctx.save_for_backward(
         block_representations,
         pseudo_queries,
         lses,
+        inverse_rms_norms,
+        attention_logits,
     )
     ctx.eps = eps
 
 
-def backward(ctx, grad_softmax_outputs, grad_lses):
-    block_representations, pseudo_queries, lses = ctx.saved_tensors
+def backward(
+    ctx,
+    grad_softmax_outputs,
+    grad_lses,
+    _grad_inverse_rms_norms,
+    _grad_attention_logits,
+):
+    (
+        block_representations,
+        pseudo_queries,
+        lses,
+        inverse_rms_norms,
+        attention_logits,
+    ) = ctx.saved_tensors
 
     num_queries = pseudo_queries.shape[0]
     B, T, D = block_representations.shape[1:]
@@ -191,6 +245,8 @@ def backward(ctx, grad_softmax_outputs, grad_lses):
             block_representations,
             pseudo_queries,
             lses,
+            inverse_rms_norms,
+            attention_logits,
             grad_softmax_outputs,
             grad_lses,
             has_grad_lses,
@@ -213,7 +269,7 @@ def backward(ctx, grad_softmax_outputs, grad_lses):
     )
 
 
-phase_1_batched_attention_triton_op.register_autograd(
+_phase_1_batched_attention_forward_with_aux_triton_op.register_autograd(
     backward,
     setup_context=setup_context,
 )

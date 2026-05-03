@@ -6,11 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
+import gc
 
-from torch.utils.checkpoint import checkpoint
 from flash_attn_res.experimental.autograd import BlockAttentionResiduals
 from flash_attn_res.ops.phase_1 import phase_1_batched_attention_triton_op
 from flash_attn_res.ops.phase_2 import phase_2_online_softmax_merge_triton_op
+from liger_kernel.transformers.functional import liger_attn_res
+from torch.utils.checkpoint import checkpoint
 
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
@@ -21,10 +23,199 @@ L = 32
 BLOCK_SIZE = 8
 NUM_BLOCKS = math.ceil(L / BLOCK_SIZE) + 1
 
-B, T, D = 64, 2048, 512
+B, T, D = 4, 2048 * 8, 2048
 BT = B * T
 
 EPS = torch.finfo(torch.float32).eps
+
+LIGER_W_NORM = torch.ones(D, device=DEVICE, dtype=DTYPE)
+
+
+def pytorch_attn_res(V, w_query, w_norm, eps=1e-6):
+    """
+    Reference PyTorch implementation.
+    V: [N, B, T, D], w_query: [D], w_norm: [D]
+    """
+    V_f32 = V.float()
+    rms = torch.sqrt(V_f32.pow(2).mean(dim=-1, keepdim=True) + eps)
+    K = (V_f32 / rms).to(V.dtype) * w_norm
+
+    scores = torch.einsum("d, n b t d -> n b t", w_query.float(), K.float())
+    alpha = scores.softmax(dim=0)
+
+    h = torch.einsum("n b t, n b t d -> b t d", alpha, V.float()).to(V.dtype)
+    return h
+
+
+def maybe_ckpt(fn, *args):
+    if torch.is_grad_enabled():
+        return checkpoint(fn, *args, use_reentrant=False)
+    return fn(*args)
+
+
+def liger_torch_forward(inputs, pseudo_queries, layers):
+    blocks = [inputs]
+    w_norm = LIGER_W_NORM.to(device=pseudo_queries.device, dtype=pseudo_queries.dtype)
+
+    for i in range(len(layers)):
+        layer = layers[i]
+
+        def step(blocks_t, q, layer=layer):
+            outputs = pytorch_attn_res(blocks_t, q, w_norm, eps=EPS)
+            return layer(outputs.to(inputs.dtype))
+
+        update = maybe_ckpt(step, torch.stack(blocks, dim=0), pseudo_queries[i])
+
+        if i % BLOCK_SIZE == 0:
+            blocks.append(update)
+        else:
+            blocks[-1] = blocks[-1] + update
+
+    def final_step(blocks_t, q):
+        return pytorch_attn_res(blocks_t, q, w_norm, eps=EPS)
+
+    return maybe_ckpt(
+        final_step,
+        torch.stack(blocks, dim=0),
+        pseudo_queries[-1],
+    ).to(inputs.dtype)
+
+
+def liger_kernel_forward(inputs, pseudo_queries, layers):
+    blocks = [inputs]
+    w_norm = LIGER_W_NORM.to(device=pseudo_queries.device, dtype=pseudo_queries.dtype)
+
+    for i in range(len(layers)):
+        layer = layers[i]
+
+        def step(blocks_t, q, layer=layer):
+            outputs = liger_attn_res(blocks_t, q, w_norm, eps=EPS)
+            return layer(outputs.to(inputs.dtype))
+
+        update = maybe_ckpt(step, torch.stack(blocks, dim=0), pseudo_queries[i])
+
+        if i % BLOCK_SIZE == 0:
+            blocks.append(update)
+        else:
+            blocks[-1] = blocks[-1] + update
+
+    def final_step(blocks_t, q):
+        return liger_attn_res(blocks_t, q, w_norm, eps=EPS)
+
+    return maybe_ckpt(
+        final_step,
+        torch.stack(blocks, dim=0),
+        pseudo_queries[-1],
+    ).to(inputs.dtype)
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def phase_1_fn(query, value):
+    query = query.to(torch.float32)
+    value = value.to(torch.float32)
+
+    D_ = value.shape[-1]
+
+    squared_norm_sum = (value * value).sum(dim=-1)
+    inverse_rms_norm = torch.rsqrt(squared_norm_sum / float(D_) + EPS)
+    raw_dot = torch.einsum("nbtd,sd->nbts", value, query)
+    logits = raw_dot * inverse_rms_norm.unsqueeze(-1)
+
+    max_logits = logits.amax(dim=0)
+    exp_weights = torch.exp(logits - max_logits.unsqueeze(0))
+    exp_sum = exp_weights.sum(dim=0)
+
+    weighted_sum = (exp_weights.unsqueeze(-1) * value.unsqueeze(3)).sum(dim=0)
+    normalized = (weighted_sum / exp_sum[..., None]).permute(2, 0, 1, 3).contiguous()
+
+    lse = (max_logits + torch.log(exp_sum)).permute(2, 0, 1).contiguous()
+
+    h = normalized[0]
+    return lse, normalized.to(torch.bfloat16), h
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def phase_2_fn(current_block_values, query_vector, prev_lse, prev_normalized):
+    query_vector_f32 = query_vector.to(torch.float32)
+    prev_normalized_f32 = prev_normalized.to(torch.float32)
+
+    current_block_values_f32 = current_block_values.to(torch.float32)
+
+    squared_norm_sum = (current_block_values_f32 * current_block_values_f32).sum(dim=-1)
+
+    inverse_rms_norm = torch.rsqrt(
+        squared_norm_sum / current_block_values_f32.shape[-1] + EPS
+    )
+
+    current_logit = (current_block_values_f32 @ query_vector_f32) * inverse_rms_norm
+
+    merged_max = torch.maximum(prev_lse, current_logit)
+    interblock_weight = torch.exp(prev_lse - merged_max)
+    intrablock_weight = torch.exp(current_logit - merged_max)
+
+    out = (
+        interblock_weight[..., None] * prev_normalized_f32
+        + intrablock_weight[..., None] * current_block_values_f32
+    ) / (interblock_weight + intrablock_weight)[..., None]
+
+    return out.to(torch.bfloat16)
+
+
+def torch_compile_phases_forward(
+    inputs, query_w, layers, checkpoint_blocks: bool = True
+):
+    blocks = [inputs]
+    input_dtype = inputs.dtype
+
+    for block_start in range(0, len(layers), BLOCK_SIZE):
+        num_queries = min(BLOCK_SIZE, len(layers) - block_start)
+        query_block = query_w[block_start : block_start + num_queries]
+
+        def run_block(query_block_arg, *prev_blocks, block_start=block_start):
+            values = torch.stack(prev_blocks, dim=0)
+
+            lse, normalized, h = phase_1_fn(query_block_arg, values)
+            curr_block = layers[block_start](h.to(input_dtype))
+
+            for offset in range(1, num_queries):
+                layer_idx = block_start + offset
+
+                h = phase_2_fn(
+                    curr_block,
+                    query_block_arg[offset],
+                    lse[offset],
+                    normalized[offset],
+                )
+
+                curr_block = curr_block + layers[layer_idx](h.to(input_dtype))
+
+            return curr_block
+
+        if checkpoint_blocks and torch.is_grad_enabled():
+            curr_block = checkpoint(
+                run_block,
+                query_block,
+                *blocks,
+                use_reentrant=False,
+            )
+        else:
+            curr_block = run_block(query_block, *blocks)
+
+        blocks.append(curr_block)
+
+    def run_final(final_query, *block_args):
+        _, _, h = phase_1_fn(final_query, torch.stack(block_args, dim=0))
+        return h.to(input_dtype)
+
+    if checkpoint_blocks and torch.is_grad_enabled():
+        return checkpoint(
+            run_final,
+            query_w[-1:],
+            *blocks,
+            use_reentrant=False,
+        )
+
+    return run_final(query_w[-1:], *blocks)
 
 
 def production_forward(inputs, pseudo_queries, layers, eps=None):
@@ -134,123 +325,6 @@ def production_forward2(
     )
 
     return final_out[0].to(inputs.dtype)
-
-
-# TODO: do max-autotune
-@torch.compile(mode="max-autotune-no-cudagraphs")
-def naive_attention_residual(pseudo_query, values):
-    keys = F.rms_norm(values, (values.shape[-1],), eps=EPS)
-
-    logits = torch.einsum("d, n b t d -> n b t", pseudo_query, keys)
-    logits = logits - logits.max(dim=0, keepdim=True).values
-
-    return torch.einsum(
-        "n b t, n b t d -> b t d",
-        logits.softmax(0),
-        values,
-    ).to(DTYPE)
-
-
-def paper_forward(inputs, pseudo_queries, layers):
-    inputs = inputs.to(torch.float32)
-    pseudo_queries = pseudo_queries.to(torch.float32)
-
-    blocks = [inputs]
-
-    for i in range(len(layers)):
-        outputs = naive_attention_residual(
-            pseudo_queries[i],
-            torch.stack(blocks, dim=0),
-        )
-
-        update = layers[i](outputs)
-
-        if i % BLOCK_SIZE == 0:
-            blocks.append(update)
-        else:
-            blocks[-1] = blocks[-1] + update
-
-    return naive_attention_residual(
-        pseudo_queries[-1],
-        torch.stack(blocks, dim=0),
-    )
-
-
-@torch.compile(mode="max-autotune-no-cudagraphs")
-def phase_1_fn(query, value):
-    query = query.to(torch.float32)
-    value = value.to(torch.float32)
-
-    D_ = value.shape[-1]
-
-    squared_norm_sum = (value * value).sum(dim=-1)
-    inverse_rms_norm = torch.rsqrt(squared_norm_sum / float(D_) + EPS)
-    raw_dot = torch.einsum("nbtd,sd->nbts", value, query)
-    logits = raw_dot * inverse_rms_norm.unsqueeze(-1)
-
-    max_logits = logits.amax(dim=0)
-    exp_weights = torch.exp(logits - max_logits.unsqueeze(0))
-    exp_sum = exp_weights.sum(dim=0)
-
-    weighted_sum = (exp_weights.unsqueeze(-1) * value.unsqueeze(3)).sum(dim=0)
-    normalized = (weighted_sum / exp_sum[..., None]).permute(2, 0, 1, 3).contiguous()
-
-    lse = (max_logits + torch.log(exp_sum)).permute(2, 0, 1).contiguous()
-
-    h = normalized[0]
-    return lse, normalized.to(torch.bfloat16), h
-
-
-@torch.compile(mode="max-autotune-no-cudagraphs")
-def phase_2_fn(current_block_values, query_vector, prev_lse, prev_normalized):
-    query_vector_f32 = query_vector.to(torch.float32)
-    prev_normalized_f32 = prev_normalized.to(torch.float32)
-
-    current_block_values_f32 = current_block_values.to(torch.float32)
-
-    squared_norm_sum = (current_block_values_f32 * current_block_values_f32).sum(dim=-1)
-
-    inverse_rms_norm = torch.rsqrt(
-        squared_norm_sum / current_block_values_f32.shape[-1] + EPS
-    )
-
-    current_logit = (current_block_values_f32 @ query_vector_f32) * inverse_rms_norm
-
-    merged_max = torch.maximum(prev_lse, current_logit)
-    interblock_weight = torch.exp(prev_lse - merged_max)
-    intrablock_weight = torch.exp(current_logit - merged_max)
-
-    out = (
-        interblock_weight[..., None] * prev_normalized_f32
-        + intrablock_weight[..., None] * current_block_values_f32
-    ) / (interblock_weight + intrablock_weight)[..., None]
-
-    return out.to(torch.bfloat16)
-
-
-def torch_compile_phases_forward(inputs, query_w, layers):
-    blocks = [inputs]
-
-    for i in range(len(layers)):
-        offset = i % BLOCK_SIZE
-
-        if offset == 0:
-            values = torch.stack(blocks, dim=0)
-
-            lse, normalized, h = phase_1_fn(query_w[i : i + BLOCK_SIZE], values)
-            blocks.append(layers[i](h.to(inputs.dtype)))
-        else:
-            h = phase_2_fn(
-                blocks[-1],
-                query_w[i],
-                lse[offset],
-                normalized[offset],
-            )
-
-            blocks[-1] = blocks[-1] + layers[i](h.to(inputs.dtype))
-
-    _, _, h = phase_1_fn(query_w[-1:], torch.stack(blocks, dim=0))
-    return h.to(inputs.dtype)
 
 
 class SwiGLU(nn.Module):
@@ -385,19 +459,36 @@ def compare_grads(
             )
             continue
 
-        diff = (rg - tg).abs()
-        rel = diff / (rg.abs() + 1e-3)
+        rg_f = rg.detach().float()
+        tg_f = tg.detach().float()
 
-        norm_rel = (rg - tg).norm() / (rg.norm() + 1e-12)
+        delta = rg_f - tg_f
+        diff = delta.abs()
+        rel = diff / (rg_f.abs() + 1e-3)
 
-        rg_abs_avg = rg.abs().mean()
-        tg_abs_avg = tg.abs().mean()
+        rg_norm = rg_f.norm()
+        tg_norm = tg_f.norm()
+
+        norm_rel = delta.norm() / (rg_norm + 1e-12)
+        norm_ratio = tg_norm / (rg_norm + 1e-12)
+
+        if rg_norm > 0 and tg_norm > 0:
+            cos = torch.nn.functional.cosine_similarity(
+                rg_f.flatten(),
+                tg_f.flatten(),
+                dim=0,
+            )
+        else:
+            cos = torch.tensor(float("nan"), device=rg_f.device)
+
+        rg_abs_avg = rg_f.abs().mean()
+        tg_abs_avg = tg_f.abs().mean()
 
         print(
             f"{test_name} grad[{idx}] vs {ref_name}: "
             f"mean_abs={diff.mean()}, max_abs={diff.max()}, "
             f"mean_rel={rel.mean()}, max_rel={rel.max()}, "
-            f"norm_rel={norm_rel}, "
+            f"norm_rel={norm_rel}, norm_ratio={norm_ratio}, cos={cos}, "
             f"ref_abs_avg={rg_abs_avg}, test_abs_avg={tg_abs_avg}"
         )
 
@@ -485,15 +576,28 @@ def print_bench(
             f"fwd+bwd={mem['fwd_bwd_reserved_gib']:.3f} GiB"
         )
 
-        abs_difference_randn = (out_paper_randn - func(*args_swiglu_randn)).abs()
-        print(f"mean abs difference randn: {abs_difference_randn.mean()}")
-        print(
-            f"mean relative difference randn: {(abs_difference_randn / (out_paper_randn.abs() + 1e-3)).mean()}"
-        )
+        with torch.inference_mode():
+            test_out = func(*args_swiglu_randn)
+            abs_difference_randn = (out_paper_randn - test_out).abs()
+
+            mean_abs = abs_difference_randn.mean().item()
+            mean_rel = (
+                (abs_difference_randn / (out_paper_randn.abs() + 1e-3)).mean().item()
+            )
+
+        print(f"mean abs difference randn: {mean_abs}")
+        print(f"mean relative difference randn: {mean_rel}")
+
+        del test_out, abs_difference_randn
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
     print()
 
 
-for i in range(5):
+for i in range(2):
     inputs = torch.randn(
         B,
         T,
@@ -526,41 +630,41 @@ for i in range(5):
     args_identity_randn = (inputs, pseudo_queries_randn, layers_identity)
 
     funcs_to_bench = [
-        ("paper_forward", paper_forward),
-        ("production_forward", production_forward),
-        ("production_forward2", production_forward2),
+        ("liger_torch_forward", liger_torch_forward),
         ("torch_compile_phases_forward", torch_compile_phases_forward),
+        ("liger_kernel_forward", liger_kernel_forward),
+        ("production_forward", production_forward),
     ]
     random.shuffle(funcs_to_bench)
 
     print("identity layers + randn queries")
     with torch.no_grad():
-        out_paper_randn = paper_forward(*args_swiglu_randn).detach()
+        out_paper_randn = liger_torch_forward(*args_swiglu_randn).detach()
     print(f"mean abs randn paper: {out_paper_randn.abs().mean()}")
     print_bench(funcs_to_bench, args_identity_randn, args_swiglu_randn, out_paper_randn)
 
     print("grads check for swiglu layers + randn queries")
     compare_grads(
-        "paper_forward",
-        paper_forward,
+        "liger_torch_forward",
+        liger_torch_forward,
         "production_forward",
         production_forward,
         *args_swiglu_randn,
         grad_out,
     )
     compare_grads(
-        "paper_forward",
-        paper_forward,
-        "torch_compile_phases_forward",
-        torch_compile_phases_forward,
+        "liger_torch_forward",
+        liger_torch_forward,
+        "liger_kernel_forward",
+        liger_kernel_forward,
         *args_swiglu_randn,
         grad_out,
     )
     compare_grads(
-        "paper_forward",
-        paper_forward,
-        "production_forward2",
-        production_forward2,
+        "liger_torch_forward",
+        liger_torch_forward,
+        "torch_compile_phases_forward",
+        torch_compile_phases_forward,
         *args_swiglu_randn,
         grad_out,
     )

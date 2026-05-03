@@ -13,6 +13,8 @@ def phase_1_batched_attention_forward_kernel(
     pseudo_queries_ptr,
     softmax_normalized_output_ptr,
     lse_ptr,
+    inverse_rms_norm_ptr,
+    attention_logits_ptr,
     eps,
     NUM_SOURCE_BLOCKS: tl.constexpr,
     BT: tl.constexpr,
@@ -40,6 +42,17 @@ def phase_1_batched_attention_forward_kernel(
     squared_norm_sum = tl.sum(source_block_values * source_block_values, axis=1)
     inverse_rms_norm = tl.rsqrt(squared_norm_sum / float(HIDDEN_DIM) + eps)
 
+    source_block_range_1d = tl.arange(0, PADDED_SRC)
+    source_block_range = source_block_range_1d[:, None]
+
+    tl.store(
+        inverse_rms_norm_ptr
+        + batch_seq_idx * NUM_SOURCE_BLOCKS
+        + source_block_range_1d,
+        inverse_rms_norm,
+        mask=valid_block_mask_1d,
+    )
+
     hidden_dim_range_1d = tl.arange(0, HIDDEN_DIM)
 
     for layer_offset in tl.static_range(NUM_QUERIES_PER_BLOCK):
@@ -48,11 +61,21 @@ def phase_1_batched_attention_forward_kernel(
             eviction_policy="evict_last",
         ).to(tl.float32)
 
-        attention_logits = (
+        raw_attention_logits = (
             tl.sum(source_block_values * pseudo_query_vector, axis=1) * inverse_rms_norm
         )
+
+        tl.store(
+            attention_logits_ptr
+            + layer_offset * (BT * NUM_SOURCE_BLOCKS)
+            + batch_seq_idx * NUM_SOURCE_BLOCKS
+            + source_block_range_1d,
+            raw_attention_logits,
+            mask=valid_block_mask_1d,
+        )
+
         attention_logits = tl.where(
-            valid_block_mask_1d, attention_logits, float("-inf")
+            valid_block_mask_1d, raw_attention_logits, float("-inf")
         )
 
         max_attention_logit = tl.max(attention_logits)
@@ -90,6 +113,8 @@ def phase_1_batched_attention_backward_kernel(
     block_representations_ptr,
     pseudo_queries_ptr,
     lse_ptr,
+    inverse_rms_norm_ptr,
+    attention_logits_ptr,
     grad_softmax_normalized_output_ptr,
     grad_lse_ptr,
     grad_block_representations_accumulator_ptr,
@@ -123,9 +148,15 @@ def phase_1_batched_attention_backward_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    squared_norm_sum = tl.sum(source_block_values * source_block_values, axis=1)
-    inverse_rms_norm = tl.rsqrt(squared_norm_sum / float(HIDDEN_DIM) + eps)
-    inverse_rms_norm_cubed = inverse_rms_norm * inverse_rms_norm * inverse_rms_norm
+    inverse_rms_norm = tl.load(
+        inverse_rms_norm_ptr
+        + batch_seq_idx * NUM_SOURCE_BLOCKS
+        + source_block_range_1d,
+        mask=valid_block_mask_1d,
+        other=0.0,
+    ).to(tl.float32)
+
+    inverse_rms_norm_squared = inverse_rms_norm * inverse_rms_norm
 
     grad_source_accumulator = tl.zeros((PADDED_SRC, HIDDEN_DIM), tl.float32)
 
@@ -153,15 +184,18 @@ def phase_1_batched_attention_backward_kernel(
             tl.float32
         )
 
-        pseudo_query_source_dot = tl.sum(
-            source_block_values * pseudo_query_vector,
-            axis=1,
-        )
+        saved_attention_logits = tl.load(
+            attention_logits_ptr
+            + layer_offset * (BT * NUM_SOURCE_BLOCKS)
+            + batch_seq_idx * NUM_SOURCE_BLOCKS
+            + source_block_range_1d,
+            mask=valid_block_mask_1d,
+            other=0.0,
+        ).to(tl.float32)
 
-        attention_logits = pseudo_query_source_dot * inverse_rms_norm
         attention_logits = tl.where(
             valid_block_mask_1d,
-            attention_logits,
+            saved_attention_logits,
             float("-inf"),
         )
 
@@ -189,8 +223,8 @@ def phase_1_batched_attention_backward_kernel(
 
         grad_source_from_logit_path = grad_attention_logits[:, None] * (
             inverse_rms_norm[:, None] * pseudo_query_vector
-            - pseudo_query_source_dot[:, None]
-            * inverse_rms_norm_cubed[:, None]
+            - saved_attention_logits[:, None]
+            * inverse_rms_norm_squared[:, None]
             * source_block_values
             / float(HIDDEN_DIM)
         )

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "flash-attn-res"
-version = "0.1.8"
+version = "0.1.12"
 description = "Attention Residuals (AttnRes) kernels"
 readme = "README.md"
 license = { text = "Apache-2.0" }

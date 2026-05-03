@@ -1,10 +1,8 @@
 ## Flash Attention Residuals
 
-> **1.4x faster inference/training** vs. torch.compile impl. of the paper’s two-phase batched attn. + online softmax
+> **2.2x faster training** vs. optimized torch.compile attention residuals implementation
 
-> **20% reduction in training memory** (without activation checkpointing)*
-
-*Benchmarked on H100. Dependent on problem size and setup.
+*Benchmarked on A100 with activation checkpointing. L=32 | BLOCK_SIZE = 8 | T=16384, D=2048
 
 Reference: https://arxiv.org/abs/2603.15031 (Kimi Team, MoonshotAI, 2026)
 
@@ -29,7 +27,7 @@ See `src` and `benchmarks` folders.
 <!-- - Consider two-phase reduction -->
 
 ## Roadmap:
-- Better autotuning defaults
+- Better autotuning set up
 - Better benchmarks
 - More robust autograd impl.
 - Precision tuning

@@ -62,16 +62,20 @@ class BlockAttentionResiduals(torch.autograd.Function):
 
             del block_attn_out, block_lse
 
-        final_out, final_lse = phase_1.phase_1_batched_attention_triton_op(
-            block_representations,
-            pseudo_queries[-1:],
-            eps,
+        final_out, final_lse, final_inverse_rms_norms, final_attention_logits = (
+            phase_1._phase_1_batched_attention_forward_with_aux_triton_op(
+                block_representations,
+                pseudo_queries[-1:],
+                eps,
+            )
         )
 
         ctx.save_for_backward(
             block_representations,
             pseudo_queries,
             final_lse,
+            final_inverse_rms_norms,
+            final_attention_logits,
         )
         ctx.layers = layers
         ctx.eps = eps
@@ -86,7 +90,14 @@ class BlockAttentionResiduals(torch.autograd.Function):
         if grad_output is None:
             return (None, None, None, None, None, *([None] * ctx.num_layer_params))
 
-        block_representations, pseudo_queries, final_lse = ctx.saved_tensors
+        (
+            block_representations,
+            pseudo_queries,
+            final_lse,
+            final_inverse_rms_norms,
+            final_attention_logits,
+        ) = ctx.saved_tensors
+
         layers = ctx.layers
         eps = ctx.eps
 
@@ -169,9 +180,13 @@ class BlockAttentionResiduals(torch.autograd.Function):
             grad_pseudo_queries_partial_final,
             eps=eps,
             accumulate_grad_blocks=False,
+            inverse_rms_norms=final_inverse_rms_norms,
+            attention_logits=final_attention_logits,
         )
 
         del grad_pseudo_queries_partial_final
+        del final_inverse_rms_norms
+        del final_attention_logits
 
         grad_block_phase1_out_scratch = torch.empty(
             BLOCK_SIZE,
@@ -211,8 +226,16 @@ class BlockAttentionResiduals(torch.autograd.Function):
             layer_input_recomputed_list = []
             layer_update_list = []
 
+            phase2_logit_list = [None] * num_queries
+            phase2_inverse_rms_norm_list = [None] * num_queries
+
             with torch.no_grad():
-                phase1_out, phase1_lse = phase_1.phase_1_batched_attention_triton_op(
+                (
+                    phase1_out,
+                    phase1_lse,
+                    phase1_inverse_rms_norms,
+                    phase1_attention_logits,
+                ) = phase_1._phase_1_batched_attention_forward_with_aux_triton_op(
                     block_representations[:curr_block_idx],
                     pseudo_queries[block_start : block_start + num_queries],
                     eps,
@@ -225,15 +248,20 @@ class BlockAttentionResiduals(torch.autograd.Function):
                     layer_input_recomputed = phase1_out[query_offset]
                 else:
                     with torch.no_grad():
-                        layer_input_recomputed = (
-                            phase_2.phase_2_online_softmax_merge_triton_op(
-                                partial_recompute,
-                                pseudo_queries[layer_idx],
-                                phase1_out[query_offset],
-                                phase1_lse[query_offset],
-                                eps,
-                            )
+                        (
+                            layer_input_recomputed,
+                            phase2_intrablock_logit,
+                            phase2_inverse_rms_norm,
+                        ) = phase_2._phase_2_online_softmax_merge_forward_with_aux_triton_op(
+                            partial_recompute,
+                            pseudo_queries[layer_idx],
+                            phase1_out[query_offset],
+                            phase1_lse[query_offset],
+                            eps,
                         )
+
+                    phase2_logit_list[query_offset] = phase2_intrablock_logit
+                    phase2_inverse_rms_norm_list[query_offset] = phase2_inverse_rms_norm
 
                 with torch.enable_grad():
                     layer_input_for_grad = (
@@ -274,11 +302,18 @@ class BlockAttentionResiduals(torch.autograd.Function):
                     with torch.no_grad():
                         partial_recompute.sub_(layer_update.detach())
 
+                    phase2_logit = phase2_logit_list[query_offset]
+                    phase2_inverse_rms_norm = phase2_inverse_rms_norm_list[query_offset]
+                    phase2_logit_list[query_offset] = None
+                    phase2_inverse_rms_norm_list[query_offset] = None
+
                     phase_2._online_softmax_merge_backward_accumulate(
                         partial_recompute,
                         pseudo_queries[layer_idx],
                         phase1_out[query_offset],
                         phase1_lse[query_offset],
+                        phase2_logit,
+                        phase2_inverse_rms_norm,
                         grad_layer_input,
                         grad_curr_partial,
                         grad_pseudo_queries[layer_idx],
@@ -295,6 +330,8 @@ class BlockAttentionResiduals(torch.autograd.Function):
             del layer_input_recomputed_list
             del layer_update_list
             del phase1_out
+            del phase2_logit_list
+            del phase2_inverse_rms_norm_list
 
             phase_1._batched_attention_backward_accumulate(
                 block_representations[:curr_block_idx],
@@ -307,9 +344,13 @@ class BlockAttentionResiduals(torch.autograd.Function):
                 grad_phase1_out,
                 eps=eps,
                 accumulate_grad_blocks=True,
+                inverse_rms_norms=phase1_inverse_rms_norms,
+                attention_logits=phase1_attention_logits,
             )
 
             del phase1_lse
+            del phase1_inverse_rms_norms
+            del phase1_attention_logits
 
         grad_inputs = (
             grad_block_representations[0].to(block_dtype)

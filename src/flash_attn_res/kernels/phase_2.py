@@ -17,6 +17,8 @@ def phase_2_online_softmax_merge_forward_kernel(
     interblock_normalized_output_ptr,
     interblock_lse_ptr,
     merged_output_ptr,
+    phase2_intrablock_logit_ptr,
+    intrablock_inverse_rms_norm_ptr,
     eps,
     HIDDEN_DIM: tl.constexpr,
 ):
@@ -47,6 +49,8 @@ def phase_2_online_softmax_merge_forward_kernel(
         intrablock_partial_sum - interblock_normalized_output
     )
 
+    tl.store(phase2_intrablock_logit_ptr + batch_seq_idx, intrablock_logit)
+    tl.store(intrablock_inverse_rms_norm_ptr + batch_seq_idx, inverse_rms_norm)
     tl.store(
         merged_output_ptr + batch_seq_idx * HIDDEN_DIM + hidden_dim_range,
         merged_output.to(tl.bfloat16),
@@ -67,6 +71,8 @@ def phase_2_online_softmax_merge_backward_kernel(
     pseudo_query_ptr,
     phase1_interblock_normalized_output_ptr,
     phase1_interblock_logsumexp_ptr,
+    phase2_intrablock_logit_ptr,
+    intrablock_inverse_rms_norm_ptr,
     grad_merged_attention_output_ptr,
     grad_intrablock_partial_sum_accumulator_ptr,
     grad_pseudo_query_accumulator_ptr,
@@ -75,8 +81,8 @@ def phase_2_online_softmax_merge_backward_kernel(
     eps,
     BT: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
-    BLOCK_BT: tl.constexpr,
     ACCUMULATE_GRAD_INTRABLOCK: tl.constexpr,
+    BLOCK_BT: tl.constexpr,
 ):
     bt_block_idx = tl.program_id(0)
 
@@ -111,27 +117,23 @@ def phase_2_online_softmax_merge_backward_kernel(
         other=float("-inf"),
     ).to(tl.float32)
 
+    phase2_intrablock_logit = tl.load(
+        phase2_intrablock_logit_ptr + bt_offsets,
+        mask=valid_bt,
+        other=0.0,
+    ).to(tl.float32)
+
+    intrablock_inverse_rms_norm = tl.load(
+        intrablock_inverse_rms_norm_ptr + bt_offsets,
+        mask=valid_bt,
+        other=0.0,
+    ).to(tl.float32)
+
     grad_merged_attention_output = tl.load(
         grad_merged_attention_output_ptr + offsets_2d,
         mask=mask_2d,
         other=0.0,
     ).to(tl.float32)
-
-    intrablock_partial_sum_squared_norm = tl.sum(
-        intrablock_partial_sum * intrablock_partial_sum,
-        axis=1,
-    )
-
-    intrablock_inverse_rms_norm = tl.rsqrt(
-        intrablock_partial_sum_squared_norm / float(HIDDEN_DIM) + eps
-    )
-
-    pseudo_query_intrablock_dot = tl.sum(
-        intrablock_partial_sum * pseudo_query[None, :],
-        axis=1,
-    )
-
-    phase2_intrablock_logit = pseudo_query_intrablock_dot * intrablock_inverse_rms_norm
 
     phase2_merge_probability = tl.sigmoid(
         phase2_intrablock_logit - phase1_interblock_logsumexp
@@ -162,18 +164,16 @@ def phase_2_online_softmax_merge_backward_kernel(
         -merge_probability_product * grad_output_dot_interblock_minus_intrablock
     )
 
-    intrablock_inverse_rms_norm_cubed = (
-        intrablock_inverse_rms_norm
-        * intrablock_inverse_rms_norm
-        * intrablock_inverse_rms_norm
+    intrablock_inverse_rms_norm_squared = (
+        intrablock_inverse_rms_norm * intrablock_inverse_rms_norm
     )
 
     grad_intrablock_partial_sum_from_logit_path = grad_phase2_intrablock_logit[
         :, None
     ] * (
         intrablock_inverse_rms_norm[:, None] * pseudo_query[None, :]
-        - pseudo_query_intrablock_dot[:, None]
-        * intrablock_inverse_rms_norm_cubed[:, None]
+        - phase2_intrablock_logit[:, None]
+        * intrablock_inverse_rms_norm_squared[:, None]
         * intrablock_partial_sum
         / float(HIDDEN_DIM)
     )
