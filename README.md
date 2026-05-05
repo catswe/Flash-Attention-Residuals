@@ -60,3 +60,6 @@ For peak performance, import `BlockAttentionResiduals` from `experimental` folde
 - Kernel is memory bound and doing semi-elementwise allows for kernel fusion
 - NUM_SOURCE_BLOCKS and NUM_QUERIES_PER_BLOCK should be autotuning keys, unlike with torch.compile, which allows for faster kernels
 - Small NUM_QUERIES_PER_BLOCK so eviction_policy should be "evict_last"
+
+## Contributing:
+- PRs are welcomed! It is highly recommended to file an issue before creating a pull request! 
