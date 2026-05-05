@@ -1,13 +1,11 @@
 ## Flash Attention Residuals
 
-> **2.2x faster training** vs. optimized torch.compile attention residuals implementation
-
-*Benchmarked on A100 with activation checkpointing. L=32 | BLOCK_SIZE = 8 | T=16384, D=2048
-
-Reference: https://arxiv.org/abs/2603.15031 (Kimi Team, MoonshotAI, 2026)
+<img width="1620" height="971" alt="image" src="https://github.com/user-attachments/assets/31ddd8e9-7235-48dc-b300-40b81dfa7ad5" />
 
 ## Credits:
 Thanks to Mohamed Osman (https://github.com/spaghettiSystems) and Cartesia (https://github.com/cartesia-ai) for advising on and supporting the development of this project.
+
+Reference: https://arxiv.org/abs/2603.15031 (Kimi Team, MoonshotAI, 2026)
 
 ## Install
 
