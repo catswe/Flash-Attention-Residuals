@@ -109,7 +109,7 @@ For more detail on usage, see `src` folders. For peak performance (not recommend
 ## Roadmap:
 - Better autotuning set up
 - Better benchmarks
-- More robust autograd impl.
+- Better mixed precision setup
 - Precision tuning
 - Mixed FP16 and BF16 and store quantization scale
 - Stochastic rounding
