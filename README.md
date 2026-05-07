@@ -98,7 +98,7 @@ def production_forward(
     return final_out.squeeze(0).to(inputs.dtype)
 ```
 
-For more detail on usage, see `src` and `benchmarks` folders. For peak performance (not recommended), check out `BlockAttentionResiduals` from `experimental` folder.
+For more detail on usage, see `src` folders. For peak performance (not recommended), check out `BlockAttentionResiduals` from `experimental` folder.
 
 <!-- TODO: -->
 <!-- - Figure out first block phase 1 special case redundant computation output -->
