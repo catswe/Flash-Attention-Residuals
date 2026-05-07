@@ -20,11 +20,6 @@ pip install flash-attn-res
 ## Usage
 This package contains Triton kernels, `triton_op` wrappers compatible with torch.compile, and an experimental high-performance Block AttenRes autograd implementation. Example usage with checkpointing:
 ```python
-from flash_attn_res.ops.phase_1 import phase_1_batched_attention_triton_op
-from flash_attn_res.ops.phase_2 import phase_2_online_softmax_merge_triton_op
-
-from torch.utils.checkpoint import checkpoint
-
 def production_forward(
     inputs: torch.Tensor,
     pseudo_queries: torch.Tensor,
@@ -62,17 +57,17 @@ def production_forward(
 
             curr_block = None
 
-            for query_offset in range(num_queries):
-                layer = layers[block_start + query_offset]
+            for i in range(num_queries):
+                layer = layers[block_start + i]
 
-                if query_offset == 0:
-                    curr_block = layer(phase1_out_unbind[query_offset])
+                if i == 0:
+                    curr_block = layer(phase1_out_unbind[i])
                 else:
                     layer_input = phase_2_online_softmax_merge_triton_op(
                         curr_block,
-                        block_queries_unbind[query_offset],
-                        phase1_out_unbind[query_offset],
-                        phase1_lse_unbind[query_offset],
+                        block_queries_unbind[i],
+                        phase1_out_unbind[i],
+                        phase1_lse_unbind[i],
                         eps,
                     )
 
