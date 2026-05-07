@@ -18,28 +18,99 @@ pip install flash-attn-res
 ```
 
 ## Usage
-This package contains Triton kernels, `triton_op` wrappers compatible with torch.compile, and an experimental high-performance Block AttenRes autograd implementation.
-
+This package contains Triton kernels, `triton_op` wrappers compatible with torch.compile, and an experimental high-performance Block AttenRes autograd implementation. Example usage with checkpointing:
 ```python
 from flash_attn_res.ops.phase_1 import phase_1_batched_attention_triton_op
 from flash_attn_res.ops.phase_2 import phase_2_online_softmax_merge_triton_op
 
-phase1_out, phase1_lse = phase_1_batched_attention_triton_op(
-    values,
-    pseudo_queries,
-    eps,
-)
+from torch.utils.checkpoint import checkpoint
 
-merged = phase_2_online_softmax_merge_triton_op(
-    curr_block,
-    pseudo_query,
-    phase1_out_i,
-    phase1_lse_i,
-    eps,
-)
+def _blockwise_attention_block_forward(
+    block_start: int,
+    layers,
+    block_queries: torch.Tensor,
+    eps: float,
+    *prev_blocks: torch.Tensor,
+) -> torch.Tensor:
+    num_queries = block_queries.shape[0]
+
+    values = torch.stack(prev_blocks, dim=0)
+
+    phase1_out, phase1_lse = phase_1_batched_attention_triton_op(
+        values,
+        block_queries,
+        eps,
+    )
+
+    # NOTE: unbind is highly important for performance
+    block_queries_unbind = block_queries.unbind(0)
+    phase1_out_unbind = phase1_out.unbind(0)
+    phase1_lse_unbind = phase1_lse.unbind(0)
+
+    curr_block = None
+
+    for query_offset in range(num_queries):
+        layer = layers[block_start + query_offset]
+
+        if query_offset == 0:
+            curr_block = layer(phase1_out_unbind[query_offset])
+        else:
+            layer_input = phase_2_online_softmax_merge_triton_op(
+                curr_block,
+                block_queries_unbind[query_offset],
+                phase1_out_unbind[query_offset],
+                phase1_lse_unbind[query_offset],
+                eps,
+            )
+            curr_block = curr_block + layer(layer_input)
+
+    return curr_block
+
+
+def production_forward(
+    inputs: torch.Tensor,
+    pseudo_queries: torch.Tensor,
+    layers,
+    eps: float | None = None,
+    block_size: int = BLOCK_SIZE,
+) -> torch.Tensor:
+    if eps is None:
+        eps = EPS
+
+    blocks = [inputs]
+
+    for block_start in range(0, len(layers), block_size):
+
+        def run_block(pseudo_queries_arg, *prev_blocks, block_start=block_start):
+            num_queries = min(block_size, len(layers) - block_start)
+            block_queries = pseudo_queries_arg[block_start : block_start + num_queries]
+
+            return _blockwise_attention_block_forward(
+                block_start,
+                layers,
+                block_queries,
+                eps,
+                *prev_blocks,
+            )
+
+        curr_block = checkpoint(
+            run_block,
+            pseudo_queries,
+            *blocks,
+            use_reentrant=False,
+        )
+        blocks.append(curr_block)
+
+    final_out, _final_lse = phase_1_batched_attention_triton_op(
+        torch.stack(blocks, dim=0),
+        pseudo_queries[-1:],
+        eps,
+    )
+
+    return final_out.squeeze(0).to(inputs.dtype)
 ```
 
-For peak performance, import `BlockAttentionResiduals` from `experimental` folder. For more detail on usage, see `src` and `benchmarks` folders.
+For more detail on usage, see `src` and `benchmarks` folders. For peak performance (not recommended), check out `BlockAttentionResiduals` from `experimental` folder.
 
 <!-- TODO: -->
 <!-- - Figure out first block phase 1 special case redundant computation output -->
