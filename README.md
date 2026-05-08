@@ -106,7 +106,7 @@ For more detail on usage, see `src` folders. For peak performance (not recommend
 
 ## Roadmap:
 - Better autotuning set up
-- Better benchmarks
+- Better tests
 - Better mixed precision setup
 - Precision tuning
 - Mixed FP16 and BF16 and store quantization scale
