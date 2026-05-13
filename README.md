@@ -105,6 +105,7 @@ For more detail on usage, see `src` folders. For peak performance (not recommend
 <!-- - Consider two-phase reduction -->
 
 ## Roadmap:
+- Pointer (indirection) table kernel impl. (potentially may not integrate cleanly with Torch)
 - Better autotuning set up
 - Better tests
 - Better mixed precision setup
